@@ -1519,6 +1519,9 @@ CUDA_DEINTERLACE_FILTERS = {
     "Bwdif": "bwdif_cuda=mode=send_frame:parity=auto:deint=all",
 }
 
+def is_cuda_deinterlace_filter(deinterlace_filter: str) -> bool:
+    return deinterlace_filter in CUDA_DEINTERLACE_FILTERS.values()
+
 # Filter used by the "Auto" mode when interlacing is detected (fast, good quality)
 AUTO_DEINTERLACE_FILTER = DEINTERLACE_FILTERS["Bwdif"]
 
@@ -2587,6 +2590,7 @@ def upscale_video(
             video_path,
             use_cuda = use_nvidia_deinterlace,
         )
+        use_cuda_deinterlace = is_cuda_deinterlace_filter(deinterlace_filter)
         frame_source_path  = get_video_frame_source(
             video_path,
             video_upscale_task.target_directory,
@@ -2601,7 +2605,7 @@ def upscale_video(
                 source_video_path          = video_path,
                 deinterlaced_video_path    = frame_source_path,
                 deinterlace_filter         = deinterlace_filter,
-                use_cuda                  = use_nvidia_deinterlace,
+                use_cuda                  = use_cuda_deinterlace,
             )
             if frame_source_path is None: return
 

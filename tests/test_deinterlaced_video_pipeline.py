@@ -107,6 +107,13 @@ class DeinterlacedVideoPipelineTests(unittest.TestCase):
             "fieldmatch=mode=pcn_ub:combmatch=full,yadif=deint=interlaced,decimate",
         )
 
+    def test_cuda_pipeline_requires_a_cuda_filter(self):
+        ivtc_filter = quality_scaler.get_deinterlace_filter("IVTC", "source.vob", use_cuda=True)
+        bwdif_filter = quality_scaler.get_deinterlace_filter("Bwdif", "source.vob", use_cuda=True)
+
+        self.assertFalse(quality_scaler.is_cuda_deinterlace_filter(ivtc_filter))
+        self.assertTrue(quality_scaler.is_cuda_deinterlace_filter(bwdif_filter))
+
     def test_ffmpeg_error_reader_keeps_the_latest_error_lines(self):
         errors = deque(maxlen=2)
 
