@@ -2812,6 +2812,8 @@ def show_realtime_logs() -> None:
     app_state.log_window = RealtimeLogWindow()
 
 class FileWidget(CTkScrollableFrame):
+    RENDER_BATCH_SIZE = 2
+
 
     def __init__(
             self, 
@@ -2833,9 +2835,12 @@ class FileWidget(CTkScrollableFrame):
 
         self.index_row = 1
         self.ui_components = []
+        self._render_generation = 0
+
         self._create_widgets()
 
     def _destroy_(self) -> None:
+        self._render_generation += 1
         self.file_list = []
         if app_state is not None:
             app_state.file_widget = None
@@ -2849,10 +2854,27 @@ class FileWidget(CTkScrollableFrame):
         self._render_cards()
 
     def _render_cards(self) -> None:
-        for file_path in self.file_list:
-            item = self._create_file_card(file_path)
-            if item is not None:
-                self.ui_components.append(item)
+        self._render_generation = getattr(self, "_render_generation", 0) + 1
+        render_generation = self._render_generation
+        file_paths = iter(self.file_list)
+
+        def render_next_batch() -> None:
+            if render_generation != self._render_generation:
+                return
+
+            for _ in range(FileWidget.RENDER_BATCH_SIZE):
+                try:
+                    file_path = next(file_paths)
+                except StopIteration:
+                    return
+
+                item = self._create_file_card(file_path)
+                if item is not None:
+                    self.ui_components.append(item)
+
+            self.after_idle(render_next_batch)
+
+        render_next_batch()
 
     def _remove_file(self, file_path: str) -> None:
         if app_state is not None and app_state.process_upscale_orchestrator is not None: return # ignore while an upscale is running
