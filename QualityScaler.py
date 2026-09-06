@@ -241,6 +241,11 @@ sharpening_list        = [ "OFF", "Low", "High" ]
 gpus_list              = [ "No GPU found" ]  # placeholder default, replaced at runtime by the detected GPUs
 keep_frames_list       = [ "OFF", "ON" ]
 deinterlace_list       = [ "Auto", "OFF", "IVTC", "Yadif", "Bwdif", "W3fdif", "ESTdif" ]
+resolution_size_list   = [ "OFF", "720p", "1080p", "2K", "4K" ]
+
+# Target vertical resolution (height) for each Resolution size preset.
+# 2K follows the common consumer naming (2560x1440, QHD).
+RESOLUTION_TARGET_HEIGHTS = { "720p": 720, "1080p": 1080, "2K": 1440, "4K": 2160 }
 image_extension_list   = [ ".png", ".jpg", ".bmp", ".tiff" ]
 video_extension_list   = [ ".mp4", ".mkv", ".avi", ".mov" ]
 video_codec_list = [ 
@@ -273,6 +278,7 @@ class UserPreferences:
     gpu:                  str = gpus_list[0]
     keep_frames:          bool = True
     deinterlace:          str = deinterlace_list[0]
+    target_resolution:    str = resolution_size_list[0]
     image_extension:      str = image_extension_list[0]
     video_extension:      str = video_extension_list[0]
     video_codec:          str = video_codec_list[0]
@@ -296,6 +302,7 @@ class ProcessingConfig:
     selected_sharpening_amount: float
     selected_keep_frames:       bool
     selected_deinterlace:       str
+    selected_target_resolution: str
     selected_image_extension:   str
     selected_video_extension:   str
     selected_video_codec:       str
@@ -338,6 +345,7 @@ ROW_GPU               = _row(4)
 ROW_OUTPUT_FORMAT     = _row(5)
 ROW_CODEC             = _row(6)
 ROW_DEINTERLACE       = _row(7)
+ROW_TARGET_RESOLUTION = _row(8)
 ROW_OUTPUT_PATH       = _row(9)
 ROW_ACTIONS           = _row(10)
 
@@ -1437,6 +1445,24 @@ def get_deinterlace_filter(selected_deinterlace: str, video_path: str) -> str:
 
     return DEINTERLACE_FILTERS.get(selected_deinterlace, "")
 
+# Target resolution --------------------
+
+def get_target_resolution_height(selected_target_resolution: str) -> int:
+    # Return the target vertical resolution for a preset ("720p" -> 720), 0 = OFF
+    return RESOLUTION_TARGET_HEIGHTS.get(selected_target_resolution, 0)
+
+def calculate_output_factor_for_target(
+        source_height:       int,
+        input_resize_factor: float,
+        upscale_factor:      int,
+        target_height:       int,
+        ) -> float:
+    # Output scale factor that brings the final resolution to the target height:
+    # source_h * input% * model_x * output% = target_h  =>  output% = target / (source_h * input% * model_x)
+    ai_output_height = source_height * input_resize_factor * upscale_factor
+    if ai_output_height <= 0 or target_height <= 0: return 1.0
+    return target_height / ai_output_height
+
 def get_image_resolution(image: numpy_ndarray) -> tuple:
     # Return height x width
     return image.shape[0], image.shape[1] 
@@ -1617,6 +1643,7 @@ def upscale_button_command() -> None:
         print(f"    Output resize factor: {int(processing_config.output_resize_factor * 100)}%")
         print(f"    Save frames: {processing_config.selected_keep_frames}")
         print(f"    Deinterlacing: {processing_config.selected_deinterlace}")
+        print(f"    Target resolution: {processing_config.selected_target_resolution}")
         print("=" * 50)
 
         App.place_stop_button()
@@ -1643,6 +1670,7 @@ def upscale_button_command() -> None:
                 processing_config.selected_sharpening_amount,
                 processing_config.selected_keep_frames,
                 processing_config.selected_deinterlace,
+                processing_config.selected_target_resolution,
                 processing_config.selected_image_extension,
                 processing_config.selected_video_extension,
                 processing_config.selected_video_codec,
@@ -1669,6 +1697,7 @@ def upscale_orchestrator(
         selected_sharpening_amount: float,
         selected_keep_frames:       bool,
         selected_deinterlace:       str,
+        selected_target_resolution: str,
         selected_image_extension:   str,
         selected_video_extension:   str,
         selected_video_codec:       str,
@@ -1706,6 +1735,7 @@ def upscale_orchestrator(
                     selected_video_codec        = selected_video_codec,
                     selected_keep_frames        = selected_keep_frames,
                     selected_deinterlace        = selected_deinterlace,
+                    selected_target_resolution  = selected_target_resolution,
                 )
             else:
                 if AI_instance_for_images is None:
@@ -1718,9 +1748,10 @@ def upscale_orchestrator(
                     selected_output_path     = selected_output_path,
                     AI_instance              = AI_instance_for_images,
                     selected_AI_model        = selected_AI_model,
-                    selected_image_extension = selected_image_extension, 
-                    input_resize_factor      = input_resize_factor, 
+                    selected_image_extension = selected_image_extension,
+                    input_resize_factor      = input_resize_factor,
                     output_resize_factor     = output_resize_factor,
+                    selected_target_resolution = selected_target_resolution,
                     selected_sharpening_amount = selected_sharpening_amount
                 )
 
@@ -1734,23 +1765,35 @@ def upscale_orchestrator(
 
 def upscale_image(
         process_status_q:           multiprocessing_Queue,
-        image_path:                 str, 
+        image_path:                 str,
         file_number:                int,
         selected_output_path:       str,
         AI_instance:                AI_upscale,
         selected_AI_model:          str,
         selected_image_extension:   str,
-        input_resize_factor:        float, 
+        input_resize_factor:        float,
         output_resize_factor:       float,
-        selected_sharpening_amount: float
+        selected_target_resolution: str = "OFF",
+        selected_sharpening_amount: float = 0
         ) -> None:
-    
+
     write_process_status(process_status_q, f"{file_number}. Upscaling image")
 
     # 1. Read the image file
     starting_image = image_read(image_path)
 
     # 2. Prepare upscaled image path
+    # When a target resolution preset is set, recalculate the output scale factor
+    # per image so the final height matches the target (720p / 1080p / 2K / 4K)
+    target_height = get_target_resolution_height(selected_target_resolution)
+    if target_height > 0:
+        output_resize_factor = calculate_output_factor_for_target(
+            source_height       = starting_image.shape[0],
+            input_resize_factor = input_resize_factor,
+            upscale_factor      = get_model_upscale_factor(selected_AI_model),
+            target_height       = target_height
+        )
+
     upscaled_image_path = prepare_output_image_filename(image_path, selected_output_path, selected_AI_model, input_resize_factor, output_resize_factor, selected_image_extension, selected_sharpening_amount)
     
     # 3. Upscale the image
@@ -1854,6 +1897,7 @@ def upscale_video(
         selected_video_codec:       str,
         selected_keep_frames:       bool,
         selected_deinterlace:       str,
+        selected_target_resolution: str = "OFF",
         ) -> None:
     
     # Internal functions
@@ -2221,6 +2265,21 @@ def upscale_video(
     # Main function
 
     # 1. Preparation
+    # When a target resolution preset is set, recalculate the output scale factor
+    # so the final video height matches the target (720p / 1080p / 2K / 4K)
+    target_height = get_target_resolution_height(selected_target_resolution)
+    if target_height > 0:
+        video_capture = opencv_VideoCapture(video_path)
+        source_height = round(video_capture.get(CAP_PROP_FRAME_HEIGHT))
+        video_capture.release()
+        output_resize_factor = calculate_output_factor_for_target(
+            source_height       = source_height,
+            input_resize_factor = input_resize_factor,
+            upscale_factor      = get_model_upscale_factor(selected_AI_model),
+            target_height       = target_height
+        )
+        print(f"[Target resolution] {selected_target_resolution} - output factor recalculated to {round(output_resize_factor * 100)}%")
+
     video_upscale_task = VideoUpscaleTask(
         video_path                  = video_path,
         selected_output_path        = selected_output_path,
@@ -2839,6 +2898,52 @@ def get_current_sharpening_amount() -> float:
         "High": 0.5,
     }.get(app_state.preferences.sharpening, 0)
 
+def get_first_file_source_height() -> Optional[int]:
+    # Height of the first selected file, used to preview the auto-computed Output scale %
+    if app_state is None or not app_state.selected_file_list: return None
+
+    file_path = app_state.selected_file_list[0]
+    if not os_path_exists(file_path): return None
+
+    if check_if_file_is_video(file_path):
+        video_capture = opencv_VideoCapture(file_path)
+        height        = round(video_capture.get(CAP_PROP_FRAME_HEIGHT))
+        video_capture.release()
+        return height if height > 0 else None
+
+    height, _width = get_image_resolution(image_read(file_path))
+    return height
+
+def update_output_scale_for_target_resolution(a = None, b = None, c = None) -> None:
+    # Recompute the Output scale % textbox when a target resolution preset is active.
+    # Trace-compatible signature (a, b, c) so it can be attached to StringVar traces.
+    if app_state is None or app_state.selected_output_resize_factor is None: return
+
+    target_height = get_target_resolution_height(app_state.preferences.target_resolution)
+    if target_height <= 0: return   # OFF -> keep the manual value
+
+    upscale_factor = get_upscale_factor()
+    if upscale_factor <= 0: return   # no AI model selected
+
+    source_height = get_first_file_source_height()
+    if not source_height: return
+
+    try:
+        input_resize_factor = int(float(str(app_state.selected_input_resize_factor.get()))) / 100
+    except Exception:
+        return
+    if input_resize_factor <= 0: return
+
+    output_resize_factor = calculate_output_factor_for_target(
+        source_height       = source_height,
+        input_resize_factor = input_resize_factor,
+        upscale_factor      = upscale_factor,
+        target_height       = target_height
+    )
+
+    app_state.selected_output_resize_factor.set(str(round(output_resize_factor * 100)))
+    update_file_widget(1, 2, 3)
+
 def _completed_video_key(video_path: str) -> tuple:
     # Ties the "already completed" flag to the settings used when it was completed, so
     # changing AI model/sharpening/resize factors doesn't keep showing a stale 100% badge.
@@ -2961,6 +3066,7 @@ def build_processing_config() -> Optional[ProcessingConfig]:
         selected_sharpening_amount = get_current_sharpening_amount(),
         selected_keep_frames       = app_state.preferences.keep_frames,
         selected_deinterlace       = app_state.preferences.deinterlace,
+        selected_target_resolution = app_state.preferences.target_resolution,
         selected_image_extension   = app_state.preferences.image_extension,
         selected_video_extension   = app_state.preferences.video_extension,
         selected_video_codec       = app_state.preferences.video_codec,
@@ -3061,6 +3167,7 @@ def open_files_action():
             bg_color             = background_color
         )
         app_state.file_widget.place(relx = 0.0, rely = 0.0, relwidth = 0.5, relheight = 1.0)
+        update_output_scale_for_target_resolution()
         app_state.info_message.set("Ready")
     else: 
         app_state.info_message.set("Not supported files :(")
@@ -3120,6 +3227,7 @@ def save_user_choices_in_json() -> None:
         "default_gpu":                  app_state.preferences.gpu,
         "default_keep_frames":          "ON" if app_state.preferences.keep_frames else "OFF",
         "default_deinterlace":          app_state.preferences.deinterlace,
+        "default_target_resolution":    app_state.preferences.target_resolution,
         "default_image_extension":      app_state.preferences.image_extension,
         "default_video_extension":      app_state.preferences.video_extension,
         "default_video_codec":          app_state.preferences.video_codec,
@@ -3149,6 +3257,7 @@ def load_user_preferences() -> UserPreferences:
             gpu                  = json_data.get("default_gpu",                  gpus_list[0]),
             keep_frames          = json_data.get("default_keep_frames",          keep_frames_list[1]) == "ON",
             deinterlace          = json_data.get("default_deinterlace",          deinterlace_list[0]) if json_data.get("default_deinterlace", deinterlace_list[0]) in deinterlace_list else deinterlace_list[0],
+            target_resolution    = json_data.get("default_target_resolution",    resolution_size_list[0]) if json_data.get("default_target_resolution", resolution_size_list[0]) in resolution_size_list else resolution_size_list[0],
             image_extension      = json_data.get("default_image_extension",      image_extension_list[0]),
             video_extension      = json_data.get("default_video_extension",      video_extension_list[0]),
             video_codec          = json_data.get("default_video_codec",          video_codec_list[0]),
@@ -3199,6 +3308,7 @@ class App():
         self.place_image_video_output_menus()
         self.place_video_codec_keep_frames_menus()
         self.place_deinterlace_menu()
+        self.place_target_resolution_menu()
         self.place_output_path_textbox()
 
         self.place_message_label()
@@ -3697,6 +3807,40 @@ class App():
         App.place_at(option_menu, COL_MENU_C, row)
 
     @staticmethod
+    def place_target_resolution_menu() -> None:
+
+        def open_info_target_resolution():
+            option_list = [
+                " Sets the final output resolution (matched on the video height) and the Output scale %"
+                " is calculated automatically from the Input scale % — no manual tuning needed",
+
+                " \n PRESETS\n"
+                "  - [OFF] Manual Output scale % (default behaviour)\n"
+                "  - [720p] 1280x720\n"
+                "  - [1080p] 1920x1080\n"
+                "  - [2K] 2560x1440 (QHD)\n"
+                "  - [4K] 3840x2160\n",
+
+                " \n NOTES\n"
+                "  - The aspect ratio is always preserved: a 4:3 DVD upscaled to 1080p becomes 1440x1080\n"
+                "  - The Output scale % shown in the textbox is based on the first selected file;\n"
+                "    each file is scaled individually to the target during upscaling\n"
+                "  - Works together with the Input scale %: e.g. 1080p source + Input 50% + 4x model + 4K preset = Output 200%\n",
+            ]
+
+            open_info_messagebox("Target resolution", "Choose the final output resolution - the Output scale % is computed for you", option_list)
+
+        row = ROW_TARGET_RESOLUTION
+
+        place_option_background(row)
+
+        info_button = App.create_info_button(open_info_target_resolution, "Target res.")
+        option_menu = App.create_option_menu(App.select_target_resolution_from_menu, resolution_size_list, app_state.preferences.target_resolution)
+
+        App.place_at(info_button, COL_INFO_L, row)
+        App.place_at(option_menu, COL_MENU_C, row)
+
+    @staticmethod
     def place_output_path_textbox() -> None:
 
         def open_info_output_path():
@@ -3848,6 +3992,7 @@ class App():
     @staticmethod
     def select_AI_from_menu(selected_option: str) -> None:
         app_state.preferences.ai_model = selected_option
+        update_output_scale_for_target_resolution()
         update_file_widget(1, 2, 3)
 
     @staticmethod
@@ -3872,6 +4017,11 @@ class App():
     @staticmethod
     def select_deinterlace_from_menu(selected_option: str) -> None:
         app_state.preferences.deinterlace = selected_option
+
+    @staticmethod
+    def select_target_resolution_from_menu(selected_option: str) -> None:
+        app_state.preferences.target_resolution = selected_option
+        update_output_scale_for_target_resolution()
 
     @staticmethod
     def select_image_extension_from_menu(selected_option: str) -> None:
@@ -4168,7 +4318,7 @@ if __name__ == "__main__":
     app_state.selected_file_list = []
 
     app_state.info_message.set("Hi :)")
-    app_state.selected_input_resize_factor.trace_add('write', update_file_widget)
+    app_state.selected_input_resize_factor.trace_add('write', update_output_scale_for_target_resolution)
     app_state.selected_output_resize_factor.trace_add('write', update_file_widget)
 
     font   = "Segoe UI"    
