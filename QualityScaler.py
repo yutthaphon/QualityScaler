@@ -240,6 +240,7 @@ AI_multithreading_list = [ "OFF", "2 threads", "4 threads", "6 threads", "8 thre
 sharpening_list        = [ "OFF", "Low", "High" ]
 gpus_list              = [ "No GPU found" ]  # placeholder default, replaced at runtime by the detected GPUs
 keep_frames_list       = [ "OFF", "ON" ]
+deinterlace_list       = [ "Auto", "OFF", "IVTC", "Yadif", "Bwdif", "W3fdif", "ESTdif" ]
 image_extension_list   = [ ".png", ".jpg", ".bmp", ".tiff" ]
 video_extension_list   = [ ".mp4", ".mkv", ".avi", ".mov" ]
 video_codec_list = [ 
@@ -253,6 +254,7 @@ OUTPUT_PATH_CODED    = "Same path as input files"
 DOCUMENT_PATH        = os_path_join(os_path_expanduser('~'), 'Documents')
 USER_PREFERENCE_PATH = find_by_relative_path(f"{DOCUMENT_PATH}{os_separator}{app_name}_{version}_userpreference.json")
 FFMPEG_EXE_PATH      = find_by_relative_path(f"Assets{os_separator}ffmpeg.exe")
+FFPROBE_EXE_PATH     = find_by_relative_path(f"Assets{os_separator}ffprobe.exe")
 LOGO_PNG_PATH        = find_by_relative_path(f"Assets{os_separator}logo.png")
 
 COMPLETED_STATUS = "Completed"
@@ -270,6 +272,7 @@ class UserPreferences:
     ai_multithreading:    str = AI_multithreading_list[0]
     gpu:                  str = gpus_list[0]
     keep_frames:          bool = True
+    deinterlace:          str = deinterlace_list[0]
     image_extension:      str = image_extension_list[0]
     video_extension:      str = video_extension_list[0]
     video_codec:          str = video_codec_list[0]
@@ -292,6 +295,7 @@ class ProcessingConfig:
     tiles_resolution:           int
     selected_sharpening_amount: float
     selected_keep_frames:       bool
+    selected_deinterlace:       str
     selected_image_extension:   str
     selected_video_extension:   str
     selected_video_codec:       str
@@ -333,6 +337,7 @@ ROW_RESOLUTION        = _row(3)
 ROW_GPU               = _row(4)
 ROW_OUTPUT_FORMAT     = _row(5)
 ROW_CODEC             = _row(6)
+ROW_DEINTERLACE       = _row(7)
 ROW_OUTPUT_PATH       = _row(9)
 ROW_ACTIONS           = _row(10)
 
@@ -1343,6 +1348,95 @@ def get_video_fps(video_path: str) -> float:
     video_capture.release()
     return frame_rate
 
+# De-interlacing ----------------------
+
+# Manual deinterlacing filters, all configured to:
+#   - output one frame per input frame (send_frame / frame) so the total frame
+#     count and the fps filter used during extraction remain unchanged
+#   - auto-detect the field order (parity = auto)
+#   - deinterlace every frame (deint = all), since the user forced the filter manually
+DEINTERLACE_FILTERS = {
+    # IVTC (Inverse Telecine): restores film sources (most movies / anime on DVD
+    # and Blu-ray) from 29.97i telecine back to clean progressive frames.
+    # fieldmatch rebuilds the original progressive frames, yadif cleans the
+    # combed frames fieldmatch could not fix, decimate removes the duplicated
+    # telecine frames. The fps filter appended by the extraction step restores
+    # the original frame rate, so the total frame count stays unchanged.
+    "IVTC":   "fieldmatch=mode=pcn_ub:combmatch=full,yadif=deint=interlaced,decimate",
+    "Yadif":  "yadif=mode=send_frame:parity=auto:deint=all",
+    "Bwdif":  "bwdif=mode=send_frame:parity=auto:deint=all",
+    "W3fdif": "w3fdif=mode=frame:parity=auto:deint=all",
+    "ESTdif": "estdif=mode=frame:parity=auto:deint=all",
+}
+
+# Filter used by the "Auto" mode when interlacing is detected (fast, good quality)
+AUTO_DEINTERLACE_FILTER = DEINTERLACE_FILTERS["Bwdif"]
+
+def is_video_interlaced(video_path: str) -> bool:
+    # Detect interlaced video, supporting DVD / VCD / Blu-ray and generic files.
+    startupinfo = get_subprocess_startupinfo()
+
+    # 1. Primary check: the stream field order reported by ffprobe
+    #    (tt/bb/tb/bt = interlaced, progressive = trusted progressive)
+    field_order = ""
+    try:
+        probe_process = subprocess_Popen(
+            [FFPROBE_EXE_PATH, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=field_order", "-of", "csv=p=0", video_path],
+            stdout     = subprocess_PIPE,
+            stderr     = subprocess_DEVNULL,
+            startupinfo = startupinfo,
+        )
+        probe_output, _ = probe_process.communicate(timeout = 30)
+        field_order     = probe_output.decode(errors = "ignore").strip().strip(",")
+
+        if field_order in ("tt", "bb", "tb", "bt"): return True
+        if field_order == "progressive":            return False
+    except Exception as e:
+        print(f"[Deinterlace] ffprobe field_order check failed: {e}")
+
+    # 2. Fallback (only when the field order is unknown): analyze the first
+    #    frames with the ffmpeg idet filter, since many DVD/Blu-ray rips and
+    #    re-encoded files report an unreliable "unknown" field order
+    try:
+        idet_process = subprocess_Popen(
+            [FFMPEG_EXE_PATH, "-nostdin", "-v", "info", "-i", video_path,
+             "-vf", "idet", "-frames:v", "240", "-an", "-f", "null", "-"],
+            stdout     = subprocess_DEVNULL,
+            stderr     = subprocess_PIPE,
+            startupinfo = startupinfo,
+        )
+        _, idet_output = idet_process.communicate(timeout = 120)
+        idet_output    = idet_output.decode(errors = "ignore") if idet_output else ""
+
+        for line in idet_output.splitlines():
+            if "Multi frame detection:" in line:
+                values = line.split(":")[-1].split()
+                if len(values) == 4:
+                    tff, bff, progressive, _undetermined = (int(v) for v in values)
+                    # Interlaced when the combing detector sees mostly interlaced frames
+                    return (tff + bff) > 0 and (tff + bff) >= progressive
+    except Exception as e:
+        print(f"[Deinterlace] idet analysis failed: {e}")
+
+    return False
+
+def get_deinterlace_filter(selected_deinterlace: str, video_path: str) -> str:
+    # Return the ffmpeg deinterlacing filter to prepend to the extraction filter
+    # chain, or "" when no deinterlacing must be applied.
+    if selected_deinterlace == "Auto":
+        if is_video_interlaced(video_path):
+            filter_name = AUTO_DEINTERLACE_FILTER.split("=")[0].capitalize()
+            print(f"[Deinterlace] Interlaced video detected, applying auto deinterlacing ({filter_name})")
+            return AUTO_DEINTERLACE_FILTER
+        print("[Deinterlace] No interlacing detected (Auto mode)")
+        return ""
+
+    if selected_deinterlace == "OFF":
+        return ""
+
+    return DEINTERLACE_FILTERS.get(selected_deinterlace, "")
+
 def get_image_resolution(image: numpy_ndarray) -> tuple:
     # Return height x width
     return image.shape[0], image.shape[1] 
@@ -1522,6 +1616,7 @@ def upscale_button_command() -> None:
         print(f"    Input resize factor: {int(processing_config.input_resize_factor * 100)}%")
         print(f"    Output resize factor: {int(processing_config.output_resize_factor * 100)}%")
         print(f"    Save frames: {processing_config.selected_keep_frames}")
+        print(f"    Deinterlacing: {processing_config.selected_deinterlace}")
         print("=" * 50)
 
         App.place_stop_button()
@@ -1547,6 +1642,7 @@ def upscale_button_command() -> None:
                 processing_config.tiles_resolution,
                 processing_config.selected_sharpening_amount,
                 processing_config.selected_keep_frames,
+                processing_config.selected_deinterlace,
                 processing_config.selected_image_extension,
                 processing_config.selected_video_extension,
                 processing_config.selected_video_codec,
@@ -1572,6 +1668,7 @@ def upscale_orchestrator(
         tiles_resolution:           int,
         selected_sharpening_amount: float,
         selected_keep_frames:       bool,
+        selected_deinterlace:       str,
         selected_image_extension:   str,
         selected_video_extension:   str,
         selected_video_codec:       str,
@@ -1608,6 +1705,7 @@ def upscale_orchestrator(
                     selected_video_extension    = selected_video_extension,
                     selected_video_codec        = selected_video_codec,
                     selected_keep_frames        = selected_keep_frames,
+                    selected_deinterlace        = selected_deinterlace,
                 )
             else:
                 if AI_instance_for_images is None:
@@ -1755,6 +1853,7 @@ def upscale_video(
         selected_video_extension:   str,
         selected_video_codec:       str,
         selected_keep_frames:       bool,
+        selected_deinterlace:       str,
         ) -> None:
     
     # Internal functions
@@ -1798,6 +1897,7 @@ def upscale_video(
             file_number:                int,
             target_directory:           str,
             video_path:                 str,
+            selected_deinterlace:       str = "Auto",
             ) -> list[str]:
 
         extracted_frame_count = [0]
@@ -1814,7 +1914,10 @@ def upscale_video(
         # 3. Create FFMPEG command to extract video frames
         # -progress pipe:1 writes structured progress ("frame=N" lines) to stdout
         # -nostats suppresses the default stderr stats overlay
-        output_pattern = os_path_join(target_directory, "frame_%03d.jpg")
+        # Deinterlacing (Auto / manual filter) is applied BEFORE the fps filter
+        output_pattern      = os_path_join(target_directory, "frame_%03d.jpg")
+        deinterlace_filter  = get_deinterlace_filter(selected_deinterlace, video_path)
+        video_filters       = f"{deinterlace_filter},fps={video_fps}" if deinterlace_filter else f"fps={video_fps}"
         extraction_command = [
             FFMPEG_EXE_PATH,
             "-y",
@@ -1825,7 +1928,7 @@ def upscale_video(
             "-err_detect", "ignore_err",
             "-hwaccel",    "auto",
             "-i",          video_path,
-            "-vf",         f"fps={video_fps}",
+            "-vf",         video_filters,
             "-an",
             "-qscale:v",   "3",
             output_pattern
@@ -2143,7 +2246,8 @@ def upscale_video(
             event_stop_upscale_process = event_stop_upscale_process,
             file_number                = file_number,
             target_directory           = video_upscale_task.target_directory,
-            video_path                 = video_path
+            video_path                 = video_path,
+            selected_deinterlace       = selected_deinterlace
         )
     
     if not extracted_frames_paths: return
@@ -2856,6 +2960,7 @@ def build_processing_config() -> Optional[ProcessingConfig]:
         tiles_resolution           = tiles_resolution,
         selected_sharpening_amount = get_current_sharpening_amount(),
         selected_keep_frames       = app_state.preferences.keep_frames,
+        selected_deinterlace       = app_state.preferences.deinterlace,
         selected_image_extension   = app_state.preferences.image_extension,
         selected_video_extension   = app_state.preferences.video_extension,
         selected_video_codec       = app_state.preferences.video_codec,
@@ -3014,6 +3119,7 @@ def save_user_choices_in_json() -> None:
         "default_AI_multithreading":    app_state.preferences.ai_multithreading,
         "default_gpu":                  app_state.preferences.gpu,
         "default_keep_frames":          "ON" if app_state.preferences.keep_frames else "OFF",
+        "default_deinterlace":          app_state.preferences.deinterlace,
         "default_image_extension":      app_state.preferences.image_extension,
         "default_video_extension":      app_state.preferences.video_extension,
         "default_video_codec":          app_state.preferences.video_codec,
@@ -3042,6 +3148,7 @@ def load_user_preferences() -> UserPreferences:
             ai_multithreading    = json_data.get("default_AI_multithreading",    AI_multithreading_list[0]),
             gpu                  = json_data.get("default_gpu",                  gpus_list[0]),
             keep_frames          = json_data.get("default_keep_frames",          keep_frames_list[1]) == "ON",
+            deinterlace          = json_data.get("default_deinterlace",          deinterlace_list[0]) if json_data.get("default_deinterlace", deinterlace_list[0]) in deinterlace_list else deinterlace_list[0],
             image_extension      = json_data.get("default_image_extension",      image_extension_list[0]),
             video_extension      = json_data.get("default_video_extension",      video_extension_list[0]),
             video_codec          = json_data.get("default_video_codec",          video_codec_list[0]),
@@ -3091,6 +3198,7 @@ class App():
         self.place_gpu_gpuVRAM_menus()
         self.place_image_video_output_menus()
         self.place_video_codec_keep_frames_menus()
+        self.place_deinterlace_menu()
         self.place_output_path_textbox()
 
         self.place_message_label()
@@ -3553,6 +3661,42 @@ class App():
         App.place_at(option_menu, COL_MENU_R, row)
 
     @staticmethod
+    def place_deinterlace_menu() -> None:
+
+        def open_info_deinterlace():
+            option_list = [
+                " Deinterlacing fixes the combing artifacts (horizontal stripes) of interlaced sources"
+                " such as DVD, VCD, 1080i Blu-ray, and TV recordings, before the frames are upscaled",
+
+                " \n OPTIONS\n"
+                "  - [Auto] Analyzes the video and applies deinterlacing only when interlacing is detected (recommended)\n"
+                "  - [OFF] No deinterlacing\n"
+                "  - [IVTC] Inverse telecine - best for film-based sources (movies / anime on DVD, Blu-ray 1080i)\n"
+                "  - [Yadif] Yet Another DeInterlacing Filter - fast and reliable\n"
+                "  - [Bwdif] Bob-weave deinterlacing filter - fast with good motion handling\n"
+                "  - [W3fdif] BBC W3 waveform-difference filter - smooth on detailed content\n"
+                "  - [ESTdif] EBU edge-sensitive spatial filter - sharp edges, low blur\n",
+
+                " \n NOTES\n"
+                "  - Manual filters are applied to every frame of the video\n"
+                "  - Use IVTC when the source comes from film (keeps full detail),\n"
+                "    and Yadif / Bwdif for real video footage (TV shows, camcorders, sport)\n"
+                "  - Deinterlacing runs before upscaling, so it cannot fix artifacts introduced by upscaling\n",
+            ]
+
+            open_info_messagebox("Deinterlace", "Remove interlacing combing artifacts from DVD, VCD, Blu-ray and TV sources", option_list)
+
+        row = ROW_DEINTERLACE
+
+        place_option_background(row)
+
+        info_button = App.create_info_button(open_info_deinterlace, "Deinterlace")
+        option_menu = App.create_option_menu(App.select_deinterlace_from_menu, deinterlace_list, app_state.preferences.deinterlace)
+
+        App.place_at(info_button, COL_INFO_L, row)
+        App.place_at(option_menu, COL_MENU_C, row)
+
+    @staticmethod
     def place_output_path_textbox() -> None:
 
         def open_info_output_path():
@@ -3724,6 +3868,10 @@ class App():
     @staticmethod
     def select_save_frame_from_menu(selected_option: str):
         app_state.preferences.keep_frames = selected_option == "ON"
+
+    @staticmethod
+    def select_deinterlace_from_menu(selected_option: str) -> None:
+        app_state.preferences.deinterlace = selected_option
 
     @staticmethod
     def select_image_extension_from_menu(selected_option: str) -> None:
