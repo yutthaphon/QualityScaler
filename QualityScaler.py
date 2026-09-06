@@ -1423,6 +1423,12 @@ def count_ffmpeg_frames(stdout, counter: list) -> None:
             try: counter[0] = int(line.split("=", 1)[1])
             except ValueError: pass
 
+def collect_ffmpeg_errors(stderr, errors: deque[str]) -> None:
+    # Keep the latest FFmpeg diagnostics so the UI can report the actual failure.
+    for raw_line in stderr:
+        line = raw_line.decode("utf-8", errors = "replace").strip()
+        if line: errors.append(line)
+
 def run_ffmpeg_with_progress(
         command:          list[str],
         frame_counter:    list[int],
@@ -1434,13 +1440,14 @@ def run_ffmpeg_with_progress(
         idle_priority:    bool = False,
         ) -> Optional[subprocess_Popen]:
     # Run an FFMPEG command, reporting "<status_prefix> N%" progress until it finishes.
-    # Returns the finished process, or None if it was stopped early via event_stop.
+    ffmpeg_errors = deque(maxlen = 20)
     ffmpeg_process = subprocess_Popen(
         command,
         stdin       = subprocess_DEVNULL,
         stdout      = subprocess_PIPE,
-        stderr      = subprocess_DEVNULL,
-        startupinfo = startupinfo
+        stderr      = subprocess_PIPE,
+        startupinfo = startupinfo,
+        bufsize     = 0,
     )
 
     if idle_priority:
@@ -1448,8 +1455,9 @@ def run_ffmpeg_with_progress(
         except Exception: pass
 
     progress_thread = Thread(target = count_ffmpeg_frames, args = (ffmpeg_process.stdout, frame_counter), daemon = True)
+    error_thread    = Thread(target = collect_ffmpeg_errors, args = (ffmpeg_process.stderr, ffmpeg_errors), daemon = True)
     progress_thread.start()
-
+    error_thread.start()
     while ffmpeg_process.poll() is None:
         if event_stop.is_set():
             print("[FFMPEG] Terminating early due to stop event")
@@ -1461,12 +1469,16 @@ def run_ffmpeg_with_progress(
                 ffmpeg_process.kill()
                 ffmpeg_process.wait(timeout=5)
             progress_thread.join(timeout=5)
+            error_thread.join(timeout=5)
+            ffmpeg_process.ffmpeg_errors = list(ffmpeg_errors)
             return None
         percent = int((frame_counter[0] / total_frames) * 100) if total_frames > 0 else 0
         write_process_status(process_status_q, f"{status_prefix} {percent}%")
         sleep(1)
 
     progress_thread.join(timeout=5)
+    error_thread.join(timeout=5)
+    ffmpeg_process.ffmpeg_errors = list(ffmpeg_errors)
     return ffmpeg_process
 
 def sanitize_fps(frame_rate: float) -> float:
@@ -2185,7 +2197,9 @@ def upscale_video(
             if deinterlacing_process is None:
                 return None
             if deinterlacing_process.returncode != 0 or not os_path_exists(deinterlaced_video_path):
-                raise RuntimeError(f"ffmpeg exited with code {deinterlacing_process.returncode}")
+                ffmpeg_errors = "\n".join(getattr(deinterlacing_process, "ffmpeg_errors", []))
+                error_detail = f": {ffmpeg_errors}" if ffmpeg_errors else ""
+                raise RuntimeError(f"ffmpeg exited with code {deinterlacing_process.returncode}{error_detail}")
         except Exception as e:
             delete_file(deinterlaced_video_path)
             write_process_status(process_status_q, f"{ERROR_STATUS} Deinterlacing failed: {e}")

@@ -1,6 +1,8 @@
+import io
 import os
 import tempfile
 import unittest
+from collections import deque
 from unittest.mock import patch
 
 import QualityScaler as quality_scaler
@@ -104,6 +106,16 @@ class DeinterlacedVideoPipelineTests(unittest.TestCase):
             deinterlace_filter,
             "fieldmatch=mode=pcn_ub:combmatch=full,yadif=deint=interlaced,decimate",
         )
+
+    def test_ffmpeg_error_reader_keeps_the_latest_error_lines(self):
+        errors = deque(maxlen=2)
+
+        quality_scaler.collect_ffmpeg_errors(
+            io.BytesIO(b"first failure\nsecond failure\nthird failure\n"),
+            errors,
+        )
+
+        self.assertEqual(list(errors), ["second failure", "third failure"])
 
 
 if __name__ == "__main__":
