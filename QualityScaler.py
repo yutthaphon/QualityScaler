@@ -1,6 +1,7 @@
 
 # Standard library imports
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from functools  import cache
 from time       import sleep
@@ -152,6 +153,7 @@ from customtkinter import (
     CTkOptionMenu,
     CTkProgressBar,
     CTkScrollableFrame,
+    CTkTextbox,
     CTkToplevel,
     CTkCanvas,
     filedialog,
@@ -270,8 +272,60 @@ STOP_STATUS      = "Stop"
 CLOSE_APP_STATUS = "CloseApp"
 
 MIN_FREE_DISK_SPACE_GB = 2
+LOG_LIMIT_OPTIONS      = (100, 200, 300, 400, 500)
+LOG_QUEUE_MAXSIZE      = 1000
 
+class RealtimeLogBuffer:
+    def __init__(self, limit: int = 200) -> None:
+        self.limit = limit
+        self._entries: deque[str] = deque(maxlen=limit)
 
+    def append(self, entry: str) -> None:
+        if entry: self._entries.append(entry)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def entries(self) -> tuple[str, ...]:
+        return tuple(self._entries)
+
+    def set_limit(self, limit: int) -> None:
+        self.limit = limit
+        self._entries = deque(self._entries, maxlen=limit)
+
+class RealtimeLogWriter:
+    def __init__(self, terminal_stream, log_queue) -> None:
+        self.terminal_stream = terminal_stream
+        self.log_queue       = log_queue
+        self.pending         = ""
+
+    def _enqueue(self, entry: str) -> None:
+        if not entry: return
+        try: self.log_queue.put_nowait(entry)
+        except Full: pass
+
+    def write(self, message: str) -> int:
+        written = self.terminal_stream.write(message)
+        self.pending += message
+        lines = self.pending.split("\n")
+        self.pending = lines.pop()
+        for line in lines: self._enqueue(line.rstrip("\r"))
+        return len(message) if written is None else written
+
+    def flush(self) -> None:
+        self.terminal_stream.flush()
+        if self.pending:
+            self._enqueue(self.pending.rstrip("\r"))
+            self.pending = ""
+
+    def __getattr__(self, name: str):
+        return getattr(self.terminal_stream, name)
+
+def configure_realtime_logging(log_queue) -> None:
+    if not isinstance(sys.stdout, RealtimeLogWriter):
+        sys.stdout = RealtimeLogWriter(sys.stdout, log_queue)
+    if not isinstance(sys.stderr, RealtimeLogWriter):
+        sys.stderr = RealtimeLogWriter(sys.stderr, log_queue)
 @dataclass
 class UserPreferences:
     app_zoom:             str = "100%"
@@ -324,8 +378,11 @@ class AppState:
     file_widget:                   Optional["FileWidget"] = None
     process_upscale_orchestrator:  Optional[Any] = None
     process_status_q:              Optional[multiprocessing_Queue] = None
+    process_log_q:                 Optional[Any] = None
     video_frames_and_info_q:       Optional[multiprocessing_Queue] = None
     event_stop_upscale_process:    Optional[any] = None
+    log_buffer:                    RealtimeLogBuffer = field(default_factory=RealtimeLogBuffer)
+    log_window:                    Optional["RealtimeLogWindow"] = None
     selected_file_list:            list[str] = field(default_factory=list)
     source_root:                   Optional[str] = None
     completed_video_files:         set = field(default_factory=set)
@@ -1649,9 +1706,24 @@ def check_upscale_steps() -> None:
         sleep(0.25)
         
 def write_process_status(process_status_q: multiprocessing_Queue, step: str) -> None:
-    
+    print(step)
     while not process_status_q.empty(): process_status_q.get()
     process_status_q.put(f"{step}")
+
+def poll_realtime_logs() -> None:
+    if app_state is None or app_state.process_log_q is None: return
+
+    updated = False
+    while True:
+        try:
+            app_state.log_buffer.append(app_state.process_log_q.get_nowait())
+            updated = True
+        except Empty:
+            break
+
+    if updated and app_state.log_window is not None and app_state.log_window.winfo_exists():
+        app_state.log_window.render()
+    app_state.window.after(100, poll_realtime_logs)
 
 def stop_upscale_process() -> None:
     print(f"[{app_name}] stop_upscale_process - setting upscale process stop event")
@@ -1717,6 +1789,7 @@ def upscale_button_command() -> None:
                 app_state.process_status_q,
                 app_state.video_frames_and_info_q,
                 app_state.event_stop_upscale_process,
+                app_state.process_log_q,
                 processing_config.selected_file_list,
                 processing_config.source_root,
                 processing_config.selected_output_path,
@@ -1744,6 +1817,7 @@ def upscale_orchestrator(
         process_status_q:           multiprocessing_Queue,
         video_frames_and_info_q:    multiprocessing_Queue,
         event_stop_upscale_process: multiprocessing_Event, # type: ignore
+        process_log_q,
 
         selected_file_list:         list[str],
         source_root:                Optional[str],
@@ -1762,6 +1836,8 @@ def upscale_orchestrator(
         selected_video_extension:   str,
         selected_video_codec:       str,
         ) -> None:
+    configure_realtime_logging(process_log_q)
+
 
     try:
         AI_instance_for_images = None
@@ -1797,6 +1873,7 @@ def upscale_orchestrator(
                     selected_deinterlace        = selected_deinterlace,
                     selected_target_resolution  = selected_target_resolution,
                     source_root                = source_root,
+                    process_log_q            = process_log_q,
                 )
             else:
                 if AI_instance_for_images is None:
@@ -1895,11 +1972,14 @@ def upscale_image(
 # Function executed as process
 
 def upscale_video_frames_async(
+        process_log_q,
         video_frames_and_info_q:    multiprocessing_Queue,
         event_stop_upscale_process: multiprocessing_Event, # type: ignore
         video_upscale_task:         VideoUpscaleTask,
         frame_chunk:                list[tuple[str, str]]
         ) -> None:
+    configure_realtime_logging(process_log_q)
+
     
     process_pid = os_getpid()
     psutil_Process(process_pid).nice(psutil_IDLE_PRIORITY_CLASS)
@@ -1954,6 +2034,7 @@ def upscale_video_frames_async(
 
 def upscale_video(
         process_status_q:           multiprocessing_Queue,
+        process_log_q,
         video_frames_and_info_q:    multiprocessing_Queue,
         event_stop_upscale_process: multiprocessing_Event, # type: ignore
         video_path:                 str, 
@@ -2241,6 +2322,7 @@ def upscale_video(
                 pool.starmap(
                     upscale_video_frames_async,
                     zip(
+                        repeat(process_log_q),
                         repeat(video_frames_and_info_q),
                         repeat(event_stop_upscale_process),
                         repeat(video_upscale_task),
@@ -2616,6 +2698,118 @@ class MessageBox(CTkToplevel):
         self.placeInfoMessageTitleSubtitle()
         self.placeInfoMessageOptionsText()
         self.placeInfoMessageOkButton()
+
+class RealtimeLogWindow(CTkToplevel):
+    def __init__(self) -> None:
+        super().__init__(master=app_state.window)
+        self.title("Realtime Logs")
+        self.geometry("760x520")
+        self.minsize(560, 360)
+        self.configure(fg_color=background_color)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        controls = CTkFrame(self, fg_color="transparent")
+        controls.pack(fill="x", padx=16, pady=(16, 8))
+
+        CTkLabel(
+            controls,
+            text="Realtime Logs",
+            text_color=UI_ACCENT_COLOR,
+            font=bold18,
+        ).pack(side="left")
+
+        self.limit_menu = CTkOptionMenu(
+            controls,
+            values=[str(limit) for limit in LOG_LIMIT_OPTIONS],
+            command=self._set_limit,
+            width=90,
+            font=bold11,
+            dropdown_font=bold12,
+            fg_color=CARD_BACKGROUND_COLOR,
+            button_color=CARD_BACKGROUND_COLOR,
+            button_hover_color=widget_background_color,
+        )
+        self.limit_menu.set(str(app_state.log_buffer.limit))
+        self.limit_menu.pack(side="right")
+
+        CTkLabel(
+            controls,
+            text="Lines",
+            text_color=CARD_MUTED_COLOR,
+            font=bold12,
+        ).pack(side="right", padx=(0, 8))
+
+        copy_button = CTkButton(
+            controls,
+            text="Copy",
+            command=lambda: self._copy(copy_button),
+            width=70,
+            font=bold11,
+            fg_color=CARD_BACKGROUND_COLOR,
+            hover_color=widget_background_color,
+            border_width=1,
+            border_color=UI_ACCENT_COLOR,
+        )
+        copy_button.pack(side="right", padx=(0, 8))
+
+        CTkButton(
+            controls,
+            text="Clear",
+            command=self._clear,
+            width=70,
+            font=bold11,
+            fg_color=CARD_BACKGROUND_COLOR,
+            hover_color=widget_background_color,
+            border_width=1,
+            border_color=UI_ACCENT_COLOR,
+        ).pack(side="right", padx=(0, 8))
+
+        self.textbox = CTkTextbox(
+            self,
+            font=bold11,
+            fg_color="#000000",
+            text_color=text_color,
+            border_width=1,
+            border_color=CARD_BORDER_COLOR,
+            corner_radius=UI_CORNER_RADIUS,
+            wrap="word",
+        )
+        self.textbox.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.render()
+        self.lift()
+
+    def _clear(self) -> None:
+        app_state.log_buffer.clear()
+        self.render()
+
+    def _close(self) -> None:
+        app_state.log_window = None
+        self.destroy()
+
+    def _copy(self, copy_button: CTkButton) -> None:
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(app_state.log_buffer.entries()))
+        self.update()
+        copy_button.configure(text="Copied!")
+
+    def _set_limit(self, selected_limit: str) -> None:
+        app_state.log_buffer.set_limit(int(selected_limit))
+        self.render()
+
+    def render(self) -> None:
+        self.textbox.configure(state="normal")
+        self.textbox.delete("1.0", "end")
+        content = "\n".join(app_state.log_buffer.entries())
+        if content: self.textbox.insert("end", f"{content}\n")
+        self.textbox.see("end")
+        self.textbox.configure(state=DISABLED)
+
+def show_realtime_logs() -> None:
+    if app_state.log_window is not None and app_state.log_window.winfo_exists():
+        app_state.log_window.lift()
+        app_state.log_window.focus_force()
+        return
+    app_state.log_window = RealtimeLogWindow()
 
 class FileWidget(CTkScrollableFrame):
 
@@ -3511,13 +3705,13 @@ class App():
         def opentelegram() -> None: open_browser(telegramme, new=1)
         def opengithub()   -> None: open_browser(githubme, new=1)
 
-        # Telegram button
+        # Header action buttons
         telegram_button = App.create_link_button(command = opentelegram, icon = logo_telegram)
-        App.place_at(telegram_button, COL_ZOOM+0.075, ROW_HEADER)
-
-        # Github button
-        git_button = App.create_link_button(command = opengithub, icon = logo_git)
-        App.place_at(git_button, COL_ZOOM+0.11, ROW_HEADER)
+        git_button      = App.create_link_button(command = opengithub, icon = logo_git)
+        log_button      = App.create_link_button(command = show_realtime_logs, icon = log_icon)
+        App.place_at(telegram_button, COL_ZOOM+0.04, ROW_HEADER)
+        App.place_at(git_button,      COL_ZOOM+0.075, ROW_HEADER)
+        App.place_at(log_button,      COL_ZOOM+0.11, ROW_HEADER)
 
     @staticmethod
     def place_AI_menu() -> None:
@@ -4378,6 +4572,10 @@ class App():
 if __name__ == "__main__":
     multiprocessing_freeze_support()
 
+    multiprocessing_manager = multiprocessing_Manager()
+    process_log_q           = multiprocessing_manager.Queue(maxsize=LOG_QUEUE_MAXSIZE)
+    configure_realtime_logging(process_log_q)
+
     preferences = load_user_preferences()
     app_state = AppState(preferences = preferences)
 
@@ -4393,7 +4591,6 @@ if __name__ == "__main__":
     else:                  queue_maxsize = 200
     print(f"[{app_name}] free RAM: {free_ram_gb:.2f} GB - queue_maxsize = {queue_maxsize}")
     
-    multiprocessing_manager    = multiprocessing_Manager()
     process_status_q           = multiprocessing_manager.Queue(maxsize=1)
     video_frames_and_info_q    = multiprocessing_manager.Queue(maxsize=queue_maxsize)
     event_stop_upscale_process = multiprocessing_manager.Event()
@@ -4406,6 +4603,7 @@ if __name__ == "__main__":
     app_state.selected_VRAM_limiter        = StringVar()
     app_state.selected_video_codec         = StringVar()
     app_state.process_status_q             = process_status_q
+    app_state.process_log_q                = process_log_q
     app_state.video_frames_and_info_q      = video_frames_and_info_q
     app_state.event_stop_upscale_process   = event_stop_upscale_process
 
@@ -4453,11 +4651,13 @@ if __name__ == "__main__":
     # Images
     logo_git      = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}github_logo.png")),    size=(18, 18))
     logo_telegram = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}telegram_logo.png")),  size=(16, 16))
+    log_icon      = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}log-file.png")),        size=(18, 18))
     stop_icon     = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}stop_icon.png")),      size=(15, 15))
     upscale_icon  = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}upscale_icon.png")),   size=(15, 15))
     clear_icon    = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}clear_icon.png")),     size=(15, 15))
     info_icon     = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}info_icon.png")),      size=(18, 18))
 
     app = App(app_state.window)
+    app_state.window.after(100, poll_realtime_logs)
     app_state.window.update()
     app_state.window.mainloop()
