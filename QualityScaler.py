@@ -355,6 +355,7 @@ class ProcessingConfig:
     input_resize_factor:        float
     output_resize_factor:       float
     selected_gpu:               str
+    use_nvidia_deinterlace:     bool
     tiles_resolution:           int
     selected_sharpening_amount: float
     selected_keep_frames:       bool
@@ -1499,6 +1500,13 @@ DEINTERLACE_FILTERS = {
     "ESTdif": "estdif=mode=frame:parity=auto:deint=all",
 }
 
+# NVIDIA CUDA equivalents available in the bundled FFmpeg. IVTC, W3FDIF, and
+# ESTDIF have no CUDA equivalent and deliberately stay on the CPU.
+CUDA_DEINTERLACE_FILTERS = {
+    "Yadif": "yadif_cuda=mode=send_frame:parity=auto:deint=all",
+    "Bwdif": "bwdif_cuda=mode=send_frame:parity=auto:deint=all",
+}
+
 # Filter used by the "Auto" mode when interlacing is detected (fast, good quality)
 AUTO_DEINTERLACE_FILTER = DEINTERLACE_FILTERS["Bwdif"]
 
@@ -1551,19 +1559,27 @@ def is_video_interlaced(video_path: str) -> bool:
 
     return False
 
-def get_deinterlace_filter(selected_deinterlace: str, video_path: str) -> str:
+def get_deinterlace_filter(selected_deinterlace: str, video_path: str, use_cuda: bool = False) -> str:
     # Return the ffmpeg deinterlacing filter to prepend to the extraction filter
     # chain, or "" when no deinterlacing must be applied.
     if selected_deinterlace == "Auto":
         if is_video_interlaced(video_path):
-            filter_name = AUTO_DEINTERLACE_FILTER.split("=")[0].capitalize()
+            deinterlace_filter = CUDA_DEINTERLACE_FILTERS["Bwdif"] if use_cuda else AUTO_DEINTERLACE_FILTER
+            filter_name = deinterlace_filter.split("=")[0].capitalize()
             print(f"[Deinterlace] Interlaced video detected, applying auto deinterlacing ({filter_name})")
-            return AUTO_DEINTERLACE_FILTER
+            return deinterlace_filter
         print("[Deinterlace] No interlacing detected (Auto mode)")
         return ""
 
     if selected_deinterlace == "OFF":
         return ""
+
+    if use_cuda and selected_deinterlace in CUDA_DEINTERLACE_FILTERS:
+        print(f"[Deinterlace] Using NVIDIA CUDA for {selected_deinterlace}")
+        return CUDA_DEINTERLACE_FILTERS[selected_deinterlace]
+
+    if use_cuda and selected_deinterlace in DEINTERLACE_FILTERS:
+        print(f"[Deinterlace] {selected_deinterlace} has no NVIDIA CUDA implementation; using CPU")
 
     return DEINTERLACE_FILTERS.get(selected_deinterlace, "")
 
@@ -1576,16 +1592,24 @@ def build_deinterlaced_video_command(
         source_video_path:       str,
         deinterlaced_video_path: str,
         deinterlace_filter:      str,
+        use_cuda:                bool = False,
         ) -> list[str]:
-    return [
+    command = [
         FFMPEG_EXE_PATH,
         "-y",
         "-loglevel", "error",
+        "-progress", "pipe:1",
+        "-nostats",
         "-threads",  "0",
-        "-i",        source_video_path,
-        "-vf",       deinterlace_filter,
+    ]
+    if use_cuda:
+        command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+
+    return command + [
+        "-i",   source_video_path,
+        "-vf",  f"{deinterlace_filter},hwdownload,format=nv12" if use_cuda else deinterlace_filter,
         "-an",
-        "-c:v",      "ffv1",
+        "-c:v", "ffv1",
         deinterlaced_video_path,
     ]
 
@@ -1827,6 +1851,7 @@ def upscale_button_command() -> None:
                 processing_config.input_resize_factor,
                 processing_config.output_resize_factor,
                 processing_config.selected_gpu,
+                processing_config.use_nvidia_deinterlace,
                 processing_config.tiles_resolution,
                 processing_config.selected_sharpening_amount,
                 processing_config.selected_keep_frames,
@@ -1856,6 +1881,7 @@ def upscale_orchestrator(
         input_resize_factor:        float,
         output_resize_factor:       float,
         selected_gpu:               str,
+        use_nvidia_deinterlace:     bool,
         tiles_resolution:           int,
         selected_sharpening_amount: float,
         selected_keep_frames:       bool,
@@ -1893,6 +1919,7 @@ def upscale_orchestrator(
                     selected_sharpening_amount  = selected_sharpening_amount,
                     selected_AI_multithreading  = selected_AI_multithreading,
                     selected_gpu                = selected_gpu,
+                    use_nvidia_deinterlace    = use_nvidia_deinterlace,
                     input_resize_factor         = input_resize_factor,
                     output_resize_factor        = output_resize_factor,
                     tiles_resolution            = tiles_resolution,
@@ -2073,6 +2100,7 @@ def upscale_video(
         selected_sharpening_amount: float,
         selected_AI_multithreading: int,
         selected_gpu:               str,
+        use_nvidia_deinterlace:     bool,
         input_resize_factor:        float,
         output_resize_factor:       float,
         tiles_resolution:           int, 
@@ -2131,8 +2159,8 @@ def upscale_video(
             source_video_path:          str,
             deinterlaced_video_path:    str,
             deinterlace_filter:         str,
+            use_cuda:                   bool,
             ) -> Optional[str]:
-
         video_capture       = opencv_VideoCapture(source_video_path)
         video_frames_number = int(video_capture.get(CAP_PROP_FRAME_COUNT))
         video_capture.release()
@@ -2144,6 +2172,7 @@ def upscale_video(
                     source_video_path,
                     deinterlaced_video_path,
                     deinterlace_filter,
+                    use_cuda = use_cuda,
                 ),
                 frame_counter    = [0],
                 total_frames     = video_frames_number,
@@ -2539,7 +2568,11 @@ def upscale_video(
         create_dir(video_upscale_task.target_directory)
         os_makedirs(video_upscale_task.upscaled_frames_directory, mode=0o777, exist_ok=True)
 
-        deinterlace_filter = get_deinterlace_filter(selected_deinterlace, video_path)
+        deinterlace_filter = get_deinterlace_filter(
+            selected_deinterlace,
+            video_path,
+            use_cuda = use_nvidia_deinterlace,
+        )
         frame_source_path  = get_video_frame_source(
             video_path,
             video_upscale_task.target_directory,
@@ -2554,6 +2587,7 @@ def upscale_video(
                 source_video_path          = video_path,
                 deinterlaced_video_path    = frame_source_path,
                 deinterlace_filter         = deinterlace_filter,
+                use_cuda                  = use_nvidia_deinterlace,
             )
             if frame_source_path is None: return
 
@@ -3451,6 +3485,8 @@ def build_processing_config() -> Optional[ProcessingConfig]:
     vram_multiplier  = VRAM_model_usage.get(selected_AI_model, 1)
     tiles_resolution = int(vram_multiplier * vram_limiter_gb * 100)
 
+    selected_gpu = GPU.find(app_state.preferences.gpu)
+
     return ProcessingConfig(
         selected_file_list         = selected_file_list,
         source_root                = app_state.source_root,
@@ -3460,6 +3496,7 @@ def build_processing_config() -> Optional[ProcessingConfig]:
         input_resize_factor        = input_resize_factor,
         output_resize_factor       = output_resize_factor,
         selected_gpu               = GPU.device_id_for(app_state.preferences.gpu),
+        use_nvidia_deinterlace     = selected_gpu is not None and selected_gpu.vendor_id == GPU.VENDOR_NVIDIA,
         tiles_resolution           = tiles_resolution,
         selected_sharpening_amount = get_current_sharpening_amount(),
         selected_keep_frames       = app_state.preferences.keep_frames,

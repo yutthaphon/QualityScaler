@@ -56,6 +56,55 @@ class DeinterlacedVideoPipelineTests(unittest.TestCase):
         self.assertEqual(command[command.index("-c:v") + 1], "ffv1")
         self.assertEqual(command[-1], "Deinterlaced.mkv")
 
+    def test_lossless_intermediate_command_reports_processed_frames(self):
+        command = quality_scaler.build_deinterlaced_video_command(
+            "source.vob",
+            "Deinterlaced.mkv",
+            quality_scaler.DEINTERLACE_FILTERS["IVTC"],
+        )
+
+        self.assertEqual(command[command.index("-progress") + 1], "pipe:1")
+
+    def test_cuda_intermediate_command_downloads_deinterlaced_frames(self):
+        command = quality_scaler.build_deinterlaced_video_command(
+            "source.vob",
+            "Deinterlaced.mkv",
+            "bwdif_cuda=mode=send_frame:parity=auto:deint=all",
+            use_cuda=True,
+        )
+
+        self.assertEqual(command[command.index("-hwaccel") + 1], "cuda")
+        self.assertEqual(command[command.index("-hwaccel_output_format") + 1], "cuda")
+        self.assertEqual(
+            command[command.index("-vf") + 1],
+            "bwdif_cuda=mode=send_frame:parity=auto:deint=all,hwdownload,format=nv12",
+        )
+
+    @patch.object(quality_scaler, "is_video_interlaced", return_value=True)
+    def test_auto_mode_uses_cuda_bwdif_when_requested(self, _is_video_interlaced):
+        deinterlace_filter = quality_scaler.get_deinterlace_filter(
+            "Auto",
+            "source.vob",
+            use_cuda=True,
+        )
+
+        self.assertEqual(
+            deinterlace_filter,
+            "bwdif_cuda=mode=send_frame:parity=auto:deint=all",
+        )
+
+    def test_ivtc_remains_cpu_filter_when_cuda_is_requested(self):
+        deinterlace_filter = quality_scaler.get_deinterlace_filter(
+            "IVTC",
+            "source.vob",
+            use_cuda=True,
+        )
+
+        self.assertEqual(
+            deinterlace_filter,
+            "fieldmatch=mode=pcn_ub:combmatch=full,yadif=deint=interlaced,decimate",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
