@@ -114,6 +114,40 @@ class DeinterlacedVideoPipelineTests(unittest.TestCase):
         self.assertFalse(quality_scaler.is_cuda_deinterlace_filter(ivtc_filter))
         self.assertTrue(quality_scaler.is_cuda_deinterlace_filter(bwdif_filter))
 
+    def test_nvidia_ivtc_pipeline_avoids_cuda_ffmpeg_arguments(self):
+        deinterlace_filter, use_cuda = quality_scaler.resolve_deinterlace_pipeline(
+            "IVTC",
+            "source.vob",
+            use_nvidia=True,
+        )
+        command = quality_scaler.build_deinterlaced_video_command(
+            "source.vob",
+            "Deinterlaced.mkv",
+            deinterlace_filter,
+            use_cuda=use_cuda,
+        )
+
+        self.assertEqual(
+            deinterlace_filter,
+            "fieldmatch=mode=pcn_ub:combmatch=full,yadif=deint=interlaced,decimate",
+        )
+        self.assertNotIn("-hwaccel", command)
+
+    def test_nvidia_bwdif_pipeline_enables_cuda_ffmpeg_arguments(self):
+        deinterlace_filter, use_cuda = quality_scaler.resolve_deinterlace_pipeline(
+            "Bwdif",
+            "source.vob",
+            use_nvidia=True,
+        )
+        command = quality_scaler.build_deinterlaced_video_command(
+            "source.vob",
+            "Deinterlaced.mkv",
+            deinterlace_filter,
+            use_cuda=use_cuda,
+        )
+
+        self.assertEqual(command[command.index("-hwaccel") + 1], "cuda")
+
     def test_ffmpeg_error_reader_keeps_the_latest_error_lines(self):
         errors = deque(maxlen=2)
 

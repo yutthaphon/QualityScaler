@@ -1598,6 +1598,18 @@ def get_deinterlace_filter(selected_deinterlace: str, video_path: str, use_cuda:
 
     return DEINTERLACE_FILTERS.get(selected_deinterlace, "")
 
+def resolve_deinterlace_pipeline(
+        selected_deinterlace: str,
+        video_path:           str,
+        use_nvidia:           bool,
+        ) -> tuple[str, bool]:
+    deinterlace_filter = get_deinterlace_filter(
+        selected_deinterlace,
+        video_path,
+        use_cuda = use_nvidia,
+    )
+    return deinterlace_filter, is_cuda_deinterlace_filter(deinterlace_filter)
+
 def get_video_frame_source(video_path: str, work_directory: str, deinterlace_filter: str) -> str:
     # Frame extraction uses a lossless intermediate only when a filter transforms the source.
     if not deinterlace_filter: return video_path
@@ -2585,12 +2597,11 @@ def upscale_video(
         create_dir(video_upscale_task.target_directory)
         os_makedirs(video_upscale_task.upscaled_frames_directory, mode=0o777, exist_ok=True)
 
-        deinterlace_filter = get_deinterlace_filter(
+        deinterlace_filter, use_cuda_deinterlace = resolve_deinterlace_pipeline(
             selected_deinterlace,
             video_path,
-            use_cuda = use_nvidia_deinterlace,
+            use_nvidia = use_nvidia_deinterlace,
         )
-        use_cuda_deinterlace = is_cuda_deinterlace_filter(deinterlace_filter)
         frame_source_path  = get_video_frame_source(
             video_path,
             video_upscale_task.target_directory,
