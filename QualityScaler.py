@@ -1067,9 +1067,9 @@ class VideoUpscaleTask:
             selected_sharpening_amount: float,
             selected_video_extension:   str,
             selected_video_codec:       str,
+            selected_deinterlace:       str,
             source_root:                Optional[str] = None,
             ) -> None:
-        
         # Passed variables
         self.video_path                 = video_path
         self.selected_output_path       = selected_output_path
@@ -1083,6 +1083,7 @@ class VideoUpscaleTask:
         self.selected_video_codec       = selected_video_codec
         self.selected_video_extension   = selected_video_extension
         self.source_root                = source_root
+        self.selected_deinterlace       = selected_deinterlace
 
         # Calculated variables
 
@@ -1093,11 +1094,12 @@ class VideoUpscaleTask:
         # 1. Video work directory
         self.target_directory = self._prepare_output_video_directory_name(
             video_path                 = self.video_path,
-            selected_output_path       = self.selected_output_path, 
+            selected_output_path       = self.selected_output_path,
             selected_AI_model          = self.selected_AI_model,
-            input_resize_factor        = self.input_resize_factor, 
-            output_resize_factor       = self.output_resize_factor, 
+            input_resize_factor        = self.input_resize_factor,
+            output_resize_factor       = self.output_resize_factor,
             selected_sharpening_amount = self.selected_sharpening_amount,
+            selected_deinterlace       = self.selected_deinterlace,
             source_root                = self.source_root,
         )
         self.raw_frames_directory      = os_path_join(self.target_directory, "Raw")
@@ -1105,13 +1107,14 @@ class VideoUpscaleTask:
 
         # 2. Video output path
         self.video_output_path = self._prepare_output_video_filename(
-            video_path                 = self.video_path, 
-            selected_output_path       = self.selected_output_path, 
-            selected_AI_model          = self.selected_AI_model, 
-            input_resize_factor        = self.input_resize_factor, 
-            output_resize_factor       = self.output_resize_factor, 
-            selected_video_extension   = self.selected_video_extension, 
+            video_path                 = self.video_path,
+            selected_output_path       = self.selected_output_path,
+            selected_AI_model          = self.selected_AI_model,
+            input_resize_factor        = self.input_resize_factor,
+            output_resize_factor       = self.output_resize_factor,
+            selected_video_extension   = self.selected_video_extension,
             selected_sharpening_amount = self.selected_sharpening_amount,
+            selected_deinterlace       = self.selected_deinterlace,
             source_root                = self.source_root,
         )
 
@@ -1232,6 +1235,7 @@ class VideoUpscaleTask:
             output_resize_factor:       float,
             selected_video_extension:   str,
             selected_sharpening_amount: float,
+            selected_deinterlace:       str,
             source_root:                Optional[str]
             ) -> str:
 
@@ -1243,6 +1247,7 @@ class VideoUpscaleTask:
             input_resize_factor        = input_resize_factor,
             output_resize_factor       = output_resize_factor,
             selected_sharpening_amount = selected_sharpening_amount,
+            selected_deinterlace       = selected_deinterlace,
             source_root                = source_root,
         )
         output_path += selected_video_extension
@@ -1257,11 +1262,13 @@ class VideoUpscaleTask:
             input_resize_factor:        float, 
             output_resize_factor:       float,
             selected_sharpening_amount: float,
+            selected_deinterlace:       str,
             source_root:                Optional[str]
             ) -> str:
         
         output_path  = _build_output_path_base(video_path, selected_output_path, source_root)
         output_path += _build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)
+        output_path += f"_Deinterlace-{selected_deinterlace}"
 
         return output_path
 
@@ -1559,6 +1566,28 @@ def get_deinterlace_filter(selected_deinterlace: str, video_path: str) -> str:
         return ""
 
     return DEINTERLACE_FILTERS.get(selected_deinterlace, "")
+
+def get_video_frame_source(video_path: str, work_directory: str, deinterlace_filter: str) -> str:
+    # Frame extraction uses a lossless intermediate only when a filter transforms the source.
+    if not deinterlace_filter: return video_path
+    return os_path_join(work_directory, "Deinterlaced.mkv")
+
+def build_deinterlaced_video_command(
+        source_video_path:       str,
+        deinterlaced_video_path: str,
+        deinterlace_filter:      str,
+        ) -> list[str]:
+    return [
+        FFMPEG_EXE_PATH,
+        "-y",
+        "-loglevel", "error",
+        "-threads",  "0",
+        "-i",        source_video_path,
+        "-vf",       deinterlace_filter,
+        "-an",
+        "-c:v",      "ffv1",
+        deinterlaced_video_path,
+    ]
 
 # Target resolution --------------------
 
@@ -2095,13 +2124,54 @@ def upscale_video(
             if f.endswith(".jpg") and f.startswith("frame_")
         ])
 
+    def deinterlace_video(
+            process_status_q:           multiprocessing_Queue,
+            event_stop_upscale_process: multiprocessing_Event, # type: ignore
+            file_number:                int,
+            source_video_path:          str,
+            deinterlaced_video_path:    str,
+            deinterlace_filter:         str,
+            ) -> Optional[str]:
+
+        video_capture       = opencv_VideoCapture(source_video_path)
+        video_frames_number = int(video_capture.get(CAP_PROP_FRAME_COUNT))
+        video_capture.release()
+
+        deinterlacing_process = None
+        try:
+            deinterlacing_process = run_ffmpeg_with_progress(
+                command          = build_deinterlaced_video_command(
+                    source_video_path,
+                    deinterlaced_video_path,
+                    deinterlace_filter,
+                ),
+                frame_counter    = [0],
+                total_frames     = video_frames_number,
+                status_prefix    = f"{file_number}. Deinterlacing video",
+                process_status_q = process_status_q,
+                event_stop       = event_stop_upscale_process,
+                startupinfo      = get_subprocess_startupinfo(),
+                idle_priority    = True,
+            )
+            if deinterlacing_process is None:
+                return None
+            if deinterlacing_process.returncode != 0 or not os_path_exists(deinterlaced_video_path):
+                raise RuntimeError(f"ffmpeg exited with code {deinterlacing_process.returncode}")
+        except Exception as e:
+            delete_file(deinterlaced_video_path)
+            write_process_status(process_status_q, f"{ERROR_STATUS} Deinterlacing failed: {e}")
+            if deinterlacing_process: deinterlacing_process.kill()
+            return None
+
+        print(f"[Deinterlace] Created lossless intermediate: {deinterlaced_video_path}")
+        return deinterlaced_video_path
+
     def extract_video_frames(
             process_status_q:           multiprocessing_Queue,
             event_stop_upscale_process: multiprocessing_Event, # type: ignore
             file_number:                int,
             raw_frames_directory:       str,
             video_path:                 str,
-            selected_deinterlace:       str = "Auto",
             ) -> list[str]:
 
         extracted_frame_count = [0]
@@ -2115,13 +2185,11 @@ def upscale_video(
         # 2. Create directory to extract frames
         os_makedirs(raw_frames_directory, mode=0o777, exist_ok=True)
 
-        # 3. Create FFMPEG command to extract video frames
+        # 3. Extract frames from either the source or the lossless deinterlaced video.
         # -progress pipe:1 writes structured progress ("frame=N" lines) to stdout
         # -nostats suppresses the default stderr stats overlay
-        # Deinterlacing (Auto / manual filter) is applied BEFORE the fps filter
-        output_pattern      = os_path_join(raw_frames_directory, "frame_%03d.jpg")
-        deinterlace_filter  = get_deinterlace_filter(selected_deinterlace, video_path)
-        video_filters       = f"{deinterlace_filter},fps={video_fps}" if deinterlace_filter else f"fps={video_fps}"
+        output_pattern = os_path_join(raw_frames_directory, "frame_%03d.jpg")
+        video_filters  = f"fps={video_fps}"
         extraction_command = [
             FFMPEG_EXE_PATH,
             "-y",
@@ -2453,6 +2521,7 @@ def upscale_video(
         selected_sharpening_amount  = selected_sharpening_amount,
         selected_video_extension    = selected_video_extension,
         selected_video_codec        = selected_video_codec,
+        selected_deinterlace        = selected_deinterlace,
         source_root                 = source_root,
     )
         
@@ -2462,18 +2531,40 @@ def upscale_video(
     )
 
     if extracted_frames_paths:
+        deinterlaced_video_path = os_path_join(video_upscale_task.target_directory, "Deinterlaced.mkv")
+        if os_path_exists(deinterlaced_video_path):
+            video_upscale_task.video_fps = get_video_fps(deinterlaced_video_path)
         write_process_status(process_status_q, f"{file_number}. Resume video upscaling")
     else:
-        write_process_status(process_status_q, f"{file_number}. Extracting video frames")
         create_dir(video_upscale_task.target_directory)
         os_makedirs(video_upscale_task.upscaled_frames_directory, mode=0o777, exist_ok=True)
+
+        deinterlace_filter = get_deinterlace_filter(selected_deinterlace, video_path)
+        frame_source_path  = get_video_frame_source(
+            video_path,
+            video_upscale_task.target_directory,
+            deinterlace_filter,
+        )
+        if frame_source_path != video_path:
+            write_process_status(process_status_q, f"{file_number}. Deinterlacing video")
+            frame_source_path = deinterlace_video(
+                process_status_q           = process_status_q,
+                event_stop_upscale_process = event_stop_upscale_process,
+                file_number                = file_number,
+                source_video_path          = video_path,
+                deinterlaced_video_path    = frame_source_path,
+                deinterlace_filter         = deinterlace_filter,
+            )
+            if frame_source_path is None: return
+
+        video_upscale_task.video_fps = get_video_fps(frame_source_path)
+        write_process_status(process_status_q, f"{file_number}. Extracting video frames")
         extracted_frames_paths = extract_video_frames(
             process_status_q           = process_status_q,
             event_stop_upscale_process = event_stop_upscale_process,
             file_number                = file_number,
             raw_frames_directory       = video_upscale_task.raw_frames_directory,
-            video_path                 = video_path,
-            selected_deinterlace       = selected_deinterlace
+            video_path                 = frame_source_path,
         )
     
     if not extracted_frames_paths: return
