@@ -1640,6 +1640,28 @@ def build_deinterlaced_video_command(
         deinterlaced_video_path,
     ]
 
+def build_video_frame_extraction_command(
+        video_path:     str,
+        output_pattern: str,
+        video_fps:      float,
+        ) -> list[str]:
+    # The lossless FFV1 intermediate is decoded in software.  Automatic hardware
+    # decode can select Vulkan, which cannot feed the CPU fps/MJPEG chain.
+    return [
+        FFMPEG_EXE_PATH,
+        "-y",
+        "-loglevel",   "error",
+        "-progress",   "pipe:1",
+        "-nostats",
+        "-threads",    "0",
+        "-err_detect", "ignore_err",
+        "-i",          video_path,
+        "-vf",         f"fps={video_fps}",
+        "-an",
+        "-qscale:v",   "3",
+        output_pattern,
+    ]
+
 # Target resolution --------------------
 
 def get_target_resolution_height(selected_target_resolution: str) -> int:
@@ -2247,22 +2269,11 @@ def upscale_video(
         # -progress pipe:1 writes structured progress ("frame=N" lines) to stdout
         # -nostats suppresses the default stderr stats overlay
         output_pattern = os_path_join(raw_frames_directory, "frame_%03d.jpg")
-        video_filters  = f"fps={video_fps}"
-        extraction_command = [
-            FFMPEG_EXE_PATH,
-            "-y",
-            "-loglevel",   "error",
-            "-progress",   "pipe:1",
-            "-nostats",
-            "-threads",    "0",
-            "-err_detect", "ignore_err",
-            "-hwaccel",    "auto",
-            "-i",          video_path,
-            "-vf",         video_filters,
-            "-an",
-            "-qscale:v",   "3",
-            output_pattern
-        ]
+        extraction_command = build_video_frame_extraction_command(
+            video_path,
+            output_pattern,
+            video_fps,
+        )
 
         # 4. Execute FFMPEG command
         startupinfo = get_subprocess_startupinfo()

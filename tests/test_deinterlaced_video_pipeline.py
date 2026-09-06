@@ -82,6 +82,16 @@ class DeinterlacedVideoPipelineTests(unittest.TestCase):
             "bwdif_cuda=mode=send_frame:parity=auto:deint=all,hwdownload,format=nv12",
         )
 
+    def test_lossless_intermediate_extraction_uses_software_decoder(self):
+        command = quality_scaler.build_video_frame_extraction_command(
+            "Deinterlaced.mkv",
+            "frames/frame_%03d.jpg",
+            23.976,
+        )
+
+        self.assertNotIn("-hwaccel", command)
+        self.assertEqual(command[command.index("-vf") + 1], "fps=23.976")
+
     @patch.object(quality_scaler, "is_video_interlaced", return_value=True)
     def test_auto_mode_uses_cuda_bwdif_when_requested(self, _is_video_interlaced):
         deinterlace_filter = quality_scaler.get_deinterlace_filter(
