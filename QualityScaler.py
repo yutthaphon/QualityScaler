@@ -34,6 +34,7 @@ from os import (
     getpid   as os_getpid,
     makedirs as os_makedirs,
     listdir  as os_listdir,
+    walk     as os_walk,
     remove   as os_remove,
     fdopen   as os_fdopen,
     open     as os_open,
@@ -48,6 +49,7 @@ from os.path import (
     join       as os_path_join,
     exists     as os_path_exists,
     splitext   as os_path_splitext,
+    relpath    as os_path_relpath,
     expanduser as os_path_expanduser
 )
 
@@ -292,6 +294,7 @@ class UserPreferences:
 @dataclass
 class ProcessingConfig:
     selected_file_list:         list[str]
+    source_root:                Optional[str]
     selected_output_path:       str
     selected_AI_model:          str
     selected_AI_multithreading: int
@@ -324,6 +327,7 @@ class AppState:
     video_frames_and_info_q:       Optional[multiprocessing_Queue] = None
     event_stop_upscale_process:    Optional[any] = None
     selected_file_list:            list[str] = field(default_factory=list)
+    source_root:                   Optional[str] = None
     completed_video_files:         set = field(default_factory=set)
 
 
@@ -384,6 +388,21 @@ supported_video_extensions = [
 ]
 
 _supported_video_extensions_set = {ext.lower() for ext in supported_video_extensions}
+
+_supported_file_extensions_set = {ext.lower() for ext in supported_file_extensions}
+
+def is_supported_file(file_path: str) -> bool:
+    return os_path_splitext(file_path)[1].lower() in _supported_file_extensions_set
+
+def discover_supported_files(source_root: str) -> list[str]:
+    source_root = os_path_abspath(source_root)
+    files = [
+        os_path_join(directory, file_name)
+        for directory, _, file_names in os_walk(source_root)
+        for file_name in file_names
+        if is_supported_file(file_name)
+    ]
+    return natsorted(files, key = lambda path: os_path_relpath(path, source_root).casefold())
 
 
 
@@ -942,13 +961,39 @@ def _build_name_suffix(
 
     return suffix
 
-def _build_output_path_base(source_path: str, selected_output_path: str) -> str:
+def _build_output_path_base(
+        source_path:          str,
+        selected_output_path: str,
+        source_root:          Optional[str] = None
+        ) -> str:
     # Output path without suffix/extension: next to the source file, or inside the chosen folder.
     if selected_output_path == OUTPUT_PATH_CODED:
         base, _ = os_path_splitext(source_path)
         return base
+
     base, _ = os_path_splitext(os_path_basename(source_path))
-    return f"{selected_output_path}{os_separator}{base}"
+    if source_root is None:
+        return os_path_join(selected_output_path, base)
+
+    relative_directory = os_path_dirname(os_path_relpath(source_path, source_root))
+    if relative_directory in ("", "."):
+        return os_path_join(selected_output_path, base)
+    return os_path_join(selected_output_path, relative_directory, base)
+
+def build_upscaled_frame_path(
+        raw_frame_path:         str,
+        upscaled_frames_folder: str,
+        selected_AI_model:      str,
+        input_resize_factor:    float,
+        output_resize_factor:   float,
+        selected_sharpening_amount: float
+        ) -> str:
+
+    frame_name, _ = os_path_splitext(os_path_basename(raw_frame_path))
+    return os_path_join(
+        upscaled_frames_folder,
+        f"{frame_name}{_build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)}.jpg"
+    )
 
 class VideoUpscaleTask:
 
@@ -965,6 +1010,7 @@ class VideoUpscaleTask:
             selected_sharpening_amount: float,
             selected_video_extension:   str,
             selected_video_codec:       str,
+            source_root:                Optional[str] = None,
             ) -> None:
         
         # Passed variables
@@ -979,6 +1025,7 @@ class VideoUpscaleTask:
         self.selected_sharpening_amount = selected_sharpening_amount
         self.selected_video_codec       = selected_video_codec
         self.selected_video_extension   = selected_video_extension
+        self.source_root                = source_root
 
         # Calculated variables
 
@@ -986,14 +1033,18 @@ class VideoUpscaleTask:
         self.upscale_factor = get_model_upscale_factor(selected_AI_model)
         
         # 1. Target directory
+        # 1. Video work directory
         self.target_directory = self._prepare_output_video_directory_name(
             video_path                 = self.video_path,
             selected_output_path       = self.selected_output_path, 
             selected_AI_model          = self.selected_AI_model,
             input_resize_factor        = self.input_resize_factor, 
             output_resize_factor       = self.output_resize_factor, 
-            selected_sharpening_amount = self.selected_sharpening_amount
+            selected_sharpening_amount = self.selected_sharpening_amount,
+            source_root                = self.source_root,
         )
+        self.raw_frames_directory      = os_path_join(self.target_directory, "Raw")
+        self.upscaled_frames_directory = os_path_join(self.target_directory, "Upscale")
 
         # 2. Video output path
         self.video_output_path = self._prepare_output_video_filename(
@@ -1003,7 +1054,8 @@ class VideoUpscaleTask:
             input_resize_factor        = self.input_resize_factor, 
             output_resize_factor       = self.output_resize_factor, 
             selected_video_extension   = self.selected_video_extension, 
-            selected_sharpening_amount = self.selected_sharpening_amount
+            selected_sharpening_amount = self.selected_sharpening_amount,
+            source_root                = self.source_root,
         )
 
         # 3. FFMPEG encoding infos
@@ -1122,10 +1174,11 @@ class VideoUpscaleTask:
             input_resize_factor:        float, 
             output_resize_factor:       float,
             selected_video_extension:   str,
-            selected_sharpening_amount: float
+            selected_sharpening_amount: float,
+            source_root:                Optional[str]
             ) -> str:
 
-        # The output filename is the output directory name plus the chosen video extension.
+        # The output filename is the work directory name plus the chosen video extension.
         output_path  = self._prepare_output_video_directory_name(
             video_path                 = video_path,
             selected_output_path       = selected_output_path,
@@ -1133,6 +1186,7 @@ class VideoUpscaleTask:
             input_resize_factor        = input_resize_factor,
             output_resize_factor       = output_resize_factor,
             selected_sharpening_amount = selected_sharpening_amount,
+            source_root                = source_root,
         )
         output_path += selected_video_extension
 
@@ -1145,10 +1199,11 @@ class VideoUpscaleTask:
             selected_AI_model:          str, 
             input_resize_factor:        float, 
             output_resize_factor:       float,
-            selected_sharpening_amount: float
+            selected_sharpening_amount: float,
+            source_root:                Optional[str]
             ) -> str:
         
-        output_path  = _build_output_path_base(video_path, selected_output_path)
+        output_path  = _build_output_path_base(video_path, selected_output_path, source_root)
         output_path += _build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)
 
         return output_path
@@ -1162,12 +1217,14 @@ class VideoUpscaleTask:
             selected_sharpening_amount: float
             ) -> str:
                 
-        file_path_no_extension, _ = os_path_splitext(frame_path)
-        output_path  = file_path_no_extension
-        output_path += _build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)
-        output_path += ".jpg"
-
-        return output_path
+        return build_upscaled_frame_path(
+            frame_path,
+            self.upscaled_frames_directory,
+            selected_AI_model,
+            input_resize_factor,
+            output_resize_factor,
+            selected_sharpening_amount,
+        )
 
     def _prepare_upscaled_frame_path_list(
             self,
@@ -1275,10 +1332,11 @@ def prepare_output_image_filename(
         input_resize_factor:        float, 
         output_resize_factor:       float,
         selected_image_extension:   str,
-        selected_sharpening_amount: float
+        selected_sharpening_amount: float,
+        source_root:                Optional[str] = None
         ) -> str:
         
-    output_path  = _build_output_path_base(image_path, selected_output_path)
+    output_path  = _build_output_path_base(image_path, selected_output_path, source_root)
     output_path += _build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)
     output_path += selected_image_extension
 
@@ -1660,6 +1718,7 @@ def upscale_button_command() -> None:
                 app_state.video_frames_and_info_q,
                 app_state.event_stop_upscale_process,
                 processing_config.selected_file_list,
+                processing_config.source_root,
                 processing_config.selected_output_path,
                 processing_config.selected_AI_model,
                 processing_config.selected_AI_multithreading,
@@ -1687,6 +1746,7 @@ def upscale_orchestrator(
         event_stop_upscale_process: multiprocessing_Event, # type: ignore
 
         selected_file_list:         list[str],
+        source_root:                Optional[str],
         selected_output_path:       str,
         selected_AI_model:          str,
         selected_AI_multithreading: int,
@@ -1736,23 +1796,25 @@ def upscale_orchestrator(
                     selected_keep_frames        = selected_keep_frames,
                     selected_deinterlace        = selected_deinterlace,
                     selected_target_resolution  = selected_target_resolution,
+                    source_root                = source_root,
                 )
             else:
                 if AI_instance_for_images is None:
                     AI_instance_for_images = AI_upscale(selected_AI_model, selected_gpu, input_resize_factor, tiles_resolution)
                 
                 upscale_image(
-                    process_status_q         = process_status_q,
-                    image_path               = file_path, 
-                    file_number              = file_number,
-                    selected_output_path     = selected_output_path,
-                    AI_instance              = AI_instance_for_images,
-                    selected_AI_model        = selected_AI_model,
-                    selected_image_extension = selected_image_extension,
-                    input_resize_factor      = input_resize_factor,
-                    output_resize_factor     = output_resize_factor,
+                    process_status_q           = process_status_q,
+                    image_path                 = file_path, 
+                    file_number                = file_number,
+                    selected_output_path       = selected_output_path,
+                    AI_instance                = AI_instance_for_images,
+                    selected_AI_model          = selected_AI_model,
+                    selected_image_extension   = selected_image_extension,
+                    input_resize_factor        = input_resize_factor,
+                    output_resize_factor       = output_resize_factor,
                     selected_target_resolution = selected_target_resolution,
-                    selected_sharpening_amount = selected_sharpening_amount
+                    selected_sharpening_amount = selected_sharpening_amount,
+                    source_root                = source_root,
                 )
 
         if not event_stop_upscale_process.is_set(): write_process_status(process_status_q, f"{COMPLETED_STATUS}")
@@ -1774,7 +1836,8 @@ def upscale_image(
         input_resize_factor:        float,
         output_resize_factor:       float,
         selected_target_resolution: str = "OFF",
-        selected_sharpening_amount: float = 0
+        selected_sharpening_amount: float = 0,
+        source_root:                Optional[str] = None
         ) -> None:
 
     write_process_status(process_status_q, f"{file_number}. Upscaling image")
@@ -1794,7 +1857,17 @@ def upscale_image(
             target_height       = target_height
         )
 
-    upscaled_image_path = prepare_output_image_filename(image_path, selected_output_path, selected_AI_model, input_resize_factor, output_resize_factor, selected_image_extension, selected_sharpening_amount)
+    upscaled_image_path = prepare_output_image_filename(
+        image_path,
+        selected_output_path,
+        selected_AI_model,
+        input_resize_factor,
+        output_resize_factor,
+        selected_image_extension,
+        selected_sharpening_amount,
+        source_root,
+    )
+    os_makedirs(os_path_dirname(upscaled_image_path), exist_ok=True)
     
     # 3. Upscale the image
     upscaled_image = AI_instance.AI_orchestration(starting_image)
@@ -1897,6 +1970,7 @@ def upscale_video(
         selected_video_codec:       str,
         selected_keep_frames:       bool,
         selected_deinterlace:       str,
+        source_root:                Optional[str],
         selected_target_resolution: str = "OFF",
         ) -> None:
     
@@ -1925,21 +1999,26 @@ def upscale_video(
             except Exception as e:
                 print(f"[create_dir] Error setting folder/ini attributes: {e}")
 
-    def get_frames_for_resume(target_directory: str, selected_AI_model: str) -> list[str]:
+    def get_frames_for_resume(raw_frames_directory: str, upscaled_frames_directory: str) -> list[str]:
 
-        if not os_path_exists(target_directory): return []
-        directory_files      = os_listdir(target_directory)
-        upscaled_frames_path = [f for f in directory_files if selected_AI_model in f]
-        if len(upscaled_frames_path) <= 1: return []
-        original_frames_path = [f for f in directory_files if f.endswith('.jpg') and selected_AI_model not in f]
+        if not os_path_exists(raw_frames_directory) or not os_path_exists(upscaled_frames_directory):
+            return []
 
-        return natsorted([os_path_join(target_directory, f) for f in original_frames_path])
+        upscaled_frames = [f for f in os_listdir(upscaled_frames_directory) if f.endswith(".jpg")]
+        if not upscaled_frames:
+            return []
+
+        return natsorted([
+            os_path_join(raw_frames_directory, f)
+            for f in os_listdir(raw_frames_directory)
+            if f.endswith(".jpg") and f.startswith("frame_")
+        ])
 
     def extract_video_frames(
             process_status_q:           multiprocessing_Queue,
             event_stop_upscale_process: multiprocessing_Event, # type: ignore
             file_number:                int,
-            target_directory:           str,
+            raw_frames_directory:       str,
             video_path:                 str,
             selected_deinterlace:       str = "Auto",
             ) -> list[str]:
@@ -1953,13 +2032,13 @@ def upscale_video(
         video_capture.release()
 
         # 2. Create directory to extract frames
-        create_dir(target_directory)
+        os_makedirs(raw_frames_directory, mode=0o777, exist_ok=True)
 
         # 3. Create FFMPEG command to extract video frames
         # -progress pipe:1 writes structured progress ("frame=N" lines) to stdout
         # -nostats suppresses the default stderr stats overlay
         # Deinterlacing (Auto / manual filter) is applied BEFORE the fps filter
-        output_pattern      = os_path_join(target_directory, "frame_%03d.jpg")
+        output_pattern      = os_path_join(raw_frames_directory, "frame_%03d.jpg")
         deinterlace_filter  = get_deinterlace_filter(selected_deinterlace, video_path)
         video_filters       = f"{deinterlace_filter},fps={video_fps}" if deinterlace_filter else f"fps={video_fps}"
         extraction_command = [
@@ -2003,8 +2082,8 @@ def upscale_video(
 
         # 5. Get extracted frames paths and return
         extracted_files = [
-            os_path_join(target_directory, f)
-            for f in natsorted(os_listdir(target_directory))
+            os_path_join(raw_frames_directory, f)
+            for f in natsorted(os_listdir(raw_frames_directory))
             if f.endswith(".jpg") and f.startswith("frame_")
         ]
 
@@ -2291,20 +2370,26 @@ def upscale_video(
         output_resize_factor        = output_resize_factor,
         selected_sharpening_amount  = selected_sharpening_amount,
         selected_video_extension    = selected_video_extension,
-        selected_video_codec        = selected_video_codec
+        selected_video_codec        = selected_video_codec,
+        source_root                 = source_root,
     )
         
-    extracted_frames_paths = get_frames_for_resume(video_upscale_task.target_directory, video_upscale_task.selected_AI_model)
+    extracted_frames_paths = get_frames_for_resume(
+        video_upscale_task.raw_frames_directory,
+        video_upscale_task.upscaled_frames_directory,
+    )
 
     if extracted_frames_paths:
         write_process_status(process_status_q, f"{file_number}. Resume video upscaling")
     else:
         write_process_status(process_status_q, f"{file_number}. Extracting video frames")
+        create_dir(video_upscale_task.target_directory)
+        os_makedirs(video_upscale_task.upscaled_frames_directory, mode=0o777, exist_ok=True)
         extracted_frames_paths = extract_video_frames(
             process_status_q           = process_status_q,
             event_stop_upscale_process = event_stop_upscale_process,
             file_number                = file_number,
-            target_directory           = video_upscale_task.target_directory,
+            raw_frames_directory       = video_upscale_task.raw_frames_directory,
             video_path                 = video_path,
             selected_deinterlace       = selected_deinterlace
         )
@@ -2561,6 +2646,7 @@ class FileWidget(CTkScrollableFrame):
         if app_state is not None:
             app_state.file_widget = None
             app_state.selected_file_list = []
+            app_state.source_root = None
         self.destroy()
         App.place_loadFile_section()
 
@@ -2970,17 +3056,21 @@ def get_video_resume_progress(video_path: str) -> Optional[int]:
     except Exception:
         return None
 
-    target_directory  = _build_output_path_base(video_path, selected_output_path)
+    target_directory  = _build_output_path_base(video_path, selected_output_path, app_state.source_root)
     target_directory += _build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)
+    raw_frames_directory      = os_path_join(target_directory, "Raw")
+    upscaled_frames_directory = os_path_join(target_directory, "Upscale")
 
-    if not os_path_exists(target_directory): return None
+    if not os_path_exists(raw_frames_directory) or not os_path_exists(upscaled_frames_directory):
+        return None
 
-    directory_files  = os_listdir(target_directory)
-    upscaled_frames  = [f for f in directory_files if selected_AI_model in f]
-    if len(upscaled_frames) <= 1: return None
+    upscaled_frames = [f for f in os_listdir(upscaled_frames_directory) if f.endswith(".jpg")]
+    if not upscaled_frames:
+        return None
 
-    extracted_frames = [f for f in directory_files if f.endswith(".jpg") and selected_AI_model not in f]
-    if not extracted_frames: return None
+    extracted_frames = [f for f in os_listdir(raw_frames_directory) if f.endswith(".jpg") and f.startswith("frame_")]
+    if not extracted_frames:
+        return None
 
     return min(100, int(len(upscaled_frames) / len(extracted_frames) * 100))
 
@@ -3056,6 +3146,7 @@ def build_processing_config() -> Optional[ProcessingConfig]:
 
     return ProcessingConfig(
         selected_file_list         = selected_file_list,
+        source_root                = app_state.source_root,
         selected_output_path       = app_state.selected_output_path.get(),
         selected_AI_model          = selected_AI_model,
         selected_AI_multithreading = get_current_ai_multithreading(),
@@ -3137,40 +3228,46 @@ def apply_app_zoom(zoom: float) -> None:
     set_window_scaling(zoom)
     set_widget_scaling(zoom)
 
+def load_selected_files(selected_file_list: list[str], source_root: Optional[str] = None) -> None:
+    if not selected_file_list:
+        app_state.info_message.set("Not supported files :(")
+        return
+
+    upscale_factor, input_resize_factor, output_resize_factor = get_values_for_file_widget()
+
+    app_state.selected_file_list = selected_file_list
+    app_state.source_root        = source_root
+    app_state.file_widget = FileWidget(
+        master               = App.get_app_window(), 
+        selected_file_list   = selected_file_list,
+        upscale_factor       = upscale_factor,
+        input_resize_factor  = input_resize_factor,
+        output_resize_factor = output_resize_factor,
+        fg_color             = background_color, 
+        bg_color             = background_color
+    )
+    app_state.file_widget.place(relx = 0.0, rely = 0.0, relwidth = 0.5, relheight = 1.0)
+    update_output_scale_for_target_resolution()
+    app_state.info_message.set("Ready")
+
 def open_files_action():
-
-    def check_supported_selected_files(uploaded_file_list: list) -> list:
-        return [file for file in uploaded_file_list if any(supported_extension in file for supported_extension in supported_file_extensions)]
-
     app_state.info_message.set("Selecting files")
 
-    uploaded_files_list    = list(filedialog.askopenfilenames())
-    uploaded_files_counter = len(uploaded_files_list)
+    uploaded_files_list = list(filedialog.askopenfilenames())
+    supported_files_list = [file for file in uploaded_files_list if is_supported_file(file)]
+    print(f"> Uploaded files: {len(uploaded_files_list)} => Supported files: {len(supported_files_list)}")
+    load_selected_files(supported_files_list)
 
-    supported_files_list    = check_supported_selected_files(uploaded_files_list)
-    supported_files_counter = len(supported_files_list)
-    
-    print("> Uploaded files: " + str(uploaded_files_counter) + " => Supported files: " + str(supported_files_counter))
-
-    if supported_files_counter > 0:
-
-        upscale_factor, input_resize_factor, output_resize_factor = get_values_for_file_widget()
-
-        app_state.selected_file_list = supported_files_list
-        app_state.file_widget = FileWidget(
-            master               = App.get_app_window(), 
-            selected_file_list   = supported_files_list,
-            upscale_factor       = upscale_factor,
-            input_resize_factor  = input_resize_factor,
-            output_resize_factor = output_resize_factor,
-            fg_color             = background_color, 
-            bg_color             = background_color
-        )
-        app_state.file_widget.place(relx = 0.0, rely = 0.0, relwidth = 0.5, relheight = 1.0)
-        update_output_scale_for_target_resolution()
+def open_folder_action():
+    app_state.info_message.set("Selecting folder")
+    source_root = filedialog.askdirectory()
+    if not source_root:
         app_state.info_message.set("Ready")
-    else: 
-        app_state.info_message.set("Not supported files :(")
+        return
+
+    supported_files_list = discover_supported_files(source_root)
+    print(f"> Selected folder: {source_root} => Supported files: {len(supported_files_list)}")
+    load_selected_files(supported_files_list, source_root)
 
 def open_output_path_action():
     asked_selected_output_path = filedialog.askdirectory()
@@ -3340,7 +3437,7 @@ class App():
             anchor     = "center"
         )
     
-        input_file_button = CTkButton(
+        input_files_button = CTkButton(
             master       = App.get_app_window(),
             command      = open_files_action, 
             text         = "SELECT FILES",
@@ -3353,10 +3450,24 @@ class App():
             text_color    = "#E0E0E0",
             border_color  = UI_ACCENT_COLOR
         )
+        input_folder_button = CTkButton(
+            master       = App.get_app_window(),
+            command      = open_folder_action, 
+            text         = "SELECT FOLDER",
+            width        = 140,
+            height       = 30,
+            font         = bold12,
+            border_width  = 2,
+            corner_radius = UI_CORNER_RADIUS,
+            fg_color      = "#282828",
+            text_color    = "#E0E0E0",
+            border_color  = UI_ACCENT_COLOR
+        )
     
         background.place(relx = 0.0, rely = 0.0, relwidth = 0.5, relheight = 1.0)
         App.place_at(input_file_text, 0.25, 0.4)
-        App.place_at(input_file_button, 0.25, 0.5)
+        App.place_at(input_files_button, 0.25, 0.5)
+        App.place_at(input_folder_button, 0.25, 0.56)
 
     @staticmethod
     def place_app_name() -> None:
@@ -3745,13 +3856,13 @@ class App():
         def open_info_keep_frames():
             option_list = [
                 "\n ON \n" + 
-                " The app does NOT delete the video frames after creating the upscaled video \n",
+                " The app keeps the Raw and Upscale frame folders after creating the video \n",
 
                 "\n OFF \n" + 
-                " The app deletes the video frames after creating the upscaled video \n"
+                " The app deletes the Raw and Upscale frame folders after creating the video \n"
             ]
 
-            open_info_messagebox("Keep frames", "Choose whether to keep the extracted frames folder after encoding", option_list)
+            open_info_messagebox("Keep frames", "Choose whether to keep the video work folder after encoding", option_list)
 
 
         row = ROW_CODEC
