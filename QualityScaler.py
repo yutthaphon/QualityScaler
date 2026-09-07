@@ -51,7 +51,8 @@ from os.path import (
     exists     as os_path_exists,
     splitext   as os_path_splitext,
     relpath    as os_path_relpath,
-    expanduser as os_path_expanduser
+    expanduser as os_path_expanduser,
+    getmtime   as os_path_getmtime
 )
 
 from subprocess import (
@@ -1685,6 +1686,73 @@ def get_square_pixel_filter(width: int, height: int, sample_aspect_ratio: float)
     if (display_width, display_height) == (width, height): return ""
     return f"scale={display_width}:{display_height},setsar=1"
 
+# Media properties / thumbnail cache --------------------
+# Reading media properties and extracting thumbnails are expensive blocking calls
+# (OpenCV video open, ffprobe SAR check, full image decode) and the file cards are
+# fully re-rendered whenever a file is added or removed. Results are cached per
+# file (path + modification time) so re-rendering the list stays responsive.
+
+MEDIA_PROPERTIES_CACHE: dict = {}
+FILE_ICON_CACHE:        dict = {}
+
+def get_file_cache_key(file_path: str) -> tuple:
+    try:    return file_path, os_path_getmtime(file_path)
+    except OSError: return file_path, 0.0
+
+def _drop_stale_cache_entries(cache: dict, file_path: str, cache_key: tuple) -> None:
+    # Discard cached values for the same file that were read before its last modification
+    for key in [key for key in cache if key[0] == file_path and key != cache_key]:
+        del cache[key]
+
+def read_media_properties(file_path) -> tuple[bool, int, int, int, float]:
+    if check_if_file_is_video(file_path):
+        # Display resolution: anamorphic sources (SAR != 1:1) are shown at
+        # their displayed size, matching what the pipeline will produce
+        width, height = get_video_display_resolution(file_path)
+        cap           = opencv_VideoCapture(file_path)
+        num_frames    = int(cap.get(CAP_PROP_FRAME_COUNT))
+        frame_rate    = sanitize_fps(cap.get(CAP_PROP_FPS))
+        cap.release()
+        return True, width, height, num_frames, frame_rate
+
+    height, width = get_image_resolution(image_read(file_path))
+    return False, width, height, 0, 0.0
+
+def read_media_properties_cached(file_path) -> tuple[bool, int, int, int, float]:
+    cache_key = get_file_cache_key(file_path)
+    _drop_stale_cache_entries(MEDIA_PROPERTIES_CACHE, file_path, cache_key)
+    if cache_key not in MEDIA_PROPERTIES_CACHE:
+        MEDIA_PROPERTIES_CACHE[cache_key] = read_media_properties(file_path)
+    return MEDIA_PROPERTIES_CACHE[cache_key]
+
+def build_file_icon(file_path):
+    max_size = 60
+
+    if check_if_file_is_video(file_path):
+        video_cap    = opencv_VideoCapture(file_path)
+        ret, frame   = video_cap.read()
+        video_cap.release()
+        if not ret or frame is None:
+            return CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}info_icon.png")), size=(60, 60))
+        source_icon = opencv_cvtColor(frame, COLOR_BGR2RGB)
+    else:
+        source_icon = opencv_cvtColor(image_read(file_path), COLOR_BGR2RGB)
+
+    ratio       = min(max_size / source_icon.shape[0], max_size / source_icon.shape[1])
+    new_width   = int(source_icon.shape[1] * ratio)
+    new_height  = int(source_icon.shape[0] * ratio)
+    source_icon = opencv_resize(source_icon,(new_width, new_height))
+    ctk_icon    = CTkImage(pillow_image_fromarray(source_icon, mode="RGB"), size = (new_width, new_height))
+
+    return ctk_icon
+
+def get_file_icon_cached(file_path):
+    cache_key = get_file_cache_key(file_path)
+    _drop_stale_cache_entries(FILE_ICON_CACHE, file_path, cache_key)
+    if cache_key not in FILE_ICON_CACHE:
+        FILE_ICON_CACHE[cache_key] = build_file_icon(file_path)
+    return FILE_ICON_CACHE[cache_key]
+
 def build_video_frame_extraction_command(
         video_path:          str,
         output_pattern:      str,
@@ -3222,39 +3290,13 @@ class FileWidget(CTkScrollableFrame):
 
     @cache
     def extract_file_icon(self, file_path) -> CTkImage:
-        max_size = 60
-
-        if check_if_file_is_video(file_path):
-            video_cap    = opencv_VideoCapture(file_path)
-            ret, frame   = video_cap.read()
-            video_cap.release()
-            if not ret or frame is None:
-                return CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}info_icon.png")), size=(60, 60))
-            source_icon = opencv_cvtColor(frame, COLOR_BGR2RGB)
-        else:
-            source_icon = opencv_cvtColor(image_read(file_path), COLOR_BGR2RGB)
-
-        ratio       = min(max_size / source_icon.shape[0], max_size / source_icon.shape[1])
-        new_width   = int(source_icon.shape[1] * ratio)
-        new_height  = int(source_icon.shape[0] * ratio)
-        source_icon = opencv_resize(source_icon,(new_width, new_height))
-        ctk_icon    = CTkImage(pillow_image_fromarray(source_icon, mode="RGB"), size = (new_width, new_height))
-
-        return ctk_icon
+        # Cached per file (path + mtime): thumbnails survive card list re-renders
+        return get_file_icon_cached(file_path)
         
     def _read_media_properties(self, file_path) -> tuple[bool, int, int, int, float]:
-        if check_if_file_is_video(file_path):
-            # Display resolution: anamorphic sources (SAR != 1:1) are shown at
-            # their displayed size, matching what the pipeline will produce
-            width, height = get_video_display_resolution(file_path)
-            cap           = opencv_VideoCapture(file_path)
-            num_frames    = int(cap.get(CAP_PROP_FRAME_COUNT))
-            frame_rate    = sanitize_fps(cap.get(CAP_PROP_FPS))
-            cap.release()
-            return True, width, height, num_frames, frame_rate
-
-        height, width = get_image_resolution(image_read(file_path))
-        return False, width, height, 0, 0.0
+        # Cached per file (path + mtime): re-rendering the whole card list after
+        # adding/removing a file must not re-probe every media file
+        return read_media_properties_cached(file_path)
 
     def _format_source_meta(self, is_video, width, height, num_frames, frame_rate) -> str:
         if not is_video:
