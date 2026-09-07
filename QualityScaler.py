@@ -247,6 +247,11 @@ gpus_list              = [ "No GPU found" ]  # placeholder default, replaced at 
 keep_frames_list       = [ "OFF", "ON" ]
 deinterlace_list       = [ "Auto", "OFF", "IVTC", "Yadif", "Bwdif", "W3fdif", "ESTdif" ]
 resolution_size_list   = [ "OFF", "720p", "1080p", "2K", "4K" ]
+target_ratio_list      = [ "Auto", "Original", "1:1", "4:3", "16:9", "21:9" ]
+
+# Aspect ratio (long side : short side) each Target ratio option forces, applied
+# to the file orientation: landscape gets e.g. 16:9, portrait 9:16.
+TARGET_RATIOS = { "1:1": 1.0, "4:3": 4 / 3, "16:9": 16 / 9, "21:9": 21 / 9 }
 
 # Target size (short side) for each Resolution size preset.
 # 2K follows the common consumer naming (2560x1440, QHD).
@@ -336,6 +341,7 @@ class UserPreferences:
     keep_frames:          bool = True
     deinterlace:          str = deinterlace_list[0]
     target_resolution:    str = resolution_size_list[0]
+    target_ratio:        str = target_ratio_list[0]
     image_extension:      str = image_extension_list[0]
     video_extension:      str = video_extension_list[0]
     video_codec:          str = video_codec_list[0]
@@ -362,6 +368,7 @@ class ProcessingConfig:
     selected_keep_frames:       bool
     selected_deinterlace:       str
     selected_target_resolution: str
+    selected_target_ratio:      str
     selected_image_extension:   str
     selected_video_extension:   str
     selected_video_codec:       str
@@ -1007,12 +1014,14 @@ def _build_name_suffix(
         selected_AI_model:          str,
         input_resize_factor:        float,
         output_resize_factor:       float,
-        selected_sharpening_amount: float
+        selected_sharpening_amount: float,
+        selected_target_ratio:      str = "Auto",
         ) -> str:
 
     suffix  = f"_{selected_AI_model}"
     suffix += f"_InputR-{str(int(input_resize_factor * 100))}"
     suffix += f"_OutputR-{str(int(output_resize_factor * 100))}"
+    if selected_target_ratio != "Auto": suffix += f"_Ratio-{selected_target_ratio}"
 
     match selected_sharpening_amount:
         case 0.3: suffix += "_Sharpening-Low"
@@ -1070,6 +1079,7 @@ class VideoUpscaleTask:
             selected_video_extension:   str,
             selected_video_codec:       str,
             selected_deinterlace:       str,
+            selected_target_ratio:      str = "Auto",
             source_root:                Optional[str] = None,
             ) -> None:
         # Passed variables
@@ -1086,12 +1096,13 @@ class VideoUpscaleTask:
         self.selected_video_extension   = selected_video_extension
         self.source_root                = source_root
         self.selected_deinterlace       = selected_deinterlace
+        self.selected_target_ratio      = selected_target_ratio
 
         # Calculated variables
 
         # Upscale factor
         self.upscale_factor = get_model_upscale_factor(selected_AI_model)
-        
+
         # 1. Target directory
         # 1. Video work directory
         self.target_directory = self._prepare_output_video_directory_name(
@@ -1102,6 +1113,7 @@ class VideoUpscaleTask:
             output_resize_factor       = self.output_resize_factor,
             selected_sharpening_amount = self.selected_sharpening_amount,
             selected_deinterlace       = self.selected_deinterlace,
+            selected_target_ratio      = self.selected_target_ratio,
             source_root                = self.source_root,
         )
         self.raw_frames_directory      = os_path_join(self.target_directory, "Raw")
@@ -1117,6 +1129,7 @@ class VideoUpscaleTask:
             selected_video_extension   = self.selected_video_extension,
             selected_sharpening_amount = self.selected_sharpening_amount,
             selected_deinterlace       = self.selected_deinterlace,
+            selected_target_ratio      = self.selected_target_ratio,
             source_root                = self.source_root,
         )
 
@@ -1234,11 +1247,12 @@ class VideoUpscaleTask:
             selected_output_path:       str,
             selected_AI_model:          str, 
             input_resize_factor:        float, 
-            output_resize_factor:       float,
+            output_resize_factor:      float,
             selected_video_extension:   str,
             selected_sharpening_amount: float,
             selected_deinterlace:       str,
-            source_root:                Optional[str]
+            selected_target_ratio:      str = "Auto",
+            source_root:                Optional[str] = None
             ) -> str:
 
         # The output filename is the work directory name plus the chosen video extension.
@@ -1250,26 +1264,33 @@ class VideoUpscaleTask:
             output_resize_factor       = output_resize_factor,
             selected_sharpening_amount = selected_sharpening_amount,
             selected_deinterlace       = selected_deinterlace,
+            selected_target_ratio      = selected_target_ratio,
             source_root                = source_root,
         )
         output_path += selected_video_extension
 
         return output_path
-
     def _prepare_output_video_directory_name(
             self,
             video_path:                 str, 
             selected_output_path:       str,
             selected_AI_model:          str, 
             input_resize_factor:        float, 
-            output_resize_factor:       float,
+            output_resize_factor:      float,
             selected_sharpening_amount: float,
             selected_deinterlace:       str,
-            source_root:                Optional[str]
+            selected_target_ratio:      str = "Auto",
+            source_root:                Optional[str] = None
             ) -> str:
         
         output_path  = _build_output_path_base(video_path, selected_output_path, source_root)
-        output_path += _build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)
+        output_path += _build_name_suffix(
+            selected_AI_model          = selected_AI_model,
+            input_resize_factor        = input_resize_factor,
+            output_resize_factor       = output_resize_factor,
+            selected_sharpening_amount = selected_sharpening_amount,
+            selected_target_ratio      = selected_target_ratio,
+        )
         output_path += f"_Deinterlace-{selected_deinterlace}"
 
         return output_path
@@ -1396,14 +1417,21 @@ def prepare_output_image_filename(
         selected_output_path:       str,
         selected_AI_model:          str, 
         input_resize_factor:        float, 
-        output_resize_factor:       float,
+        output_resize_factor:      float,
         selected_image_extension:   str,
         selected_sharpening_amount: float,
-        source_root:                Optional[str] = None
+        source_root:                Optional[str] = None,
+        selected_target_ratio:      str = "Auto",
         ) -> str:
         
     output_path  = _build_output_path_base(image_path, selected_output_path, source_root)
-    output_path += _build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)
+    output_path += _build_name_suffix(
+        selected_AI_model          = selected_AI_model,
+        input_resize_factor        = input_resize_factor,
+        output_resize_factor       = output_resize_factor,
+        selected_sharpening_amount = selected_sharpening_amount,
+        selected_target_ratio      = selected_target_ratio,
+    )
     output_path += selected_image_extension
 
     return output_path
@@ -1686,6 +1714,54 @@ def get_square_pixel_filter(width: int, height: int, sample_aspect_ratio: float)
     if (display_width, display_height) == (width, height): return ""
     return f"scale={display_width}:{display_height},setsar=1"
 
+def get_target_ratio_dimensions(
+        width:                 int,
+        height:                int,
+        selected_target_ratio: str,
+        sample_aspect_ratio:   float = 1.0,
+        ) -> tuple[int, int]:
+    # Frame dimensions the pipeline must produce for the chosen Target ratio:
+    #  - "Auto":     SAR-corrected display dimensions (default behaviour)
+    #  - "Original": stored dimensions as-is, ignoring any SAR flag (for files
+    #                whose SAR metadata is wrong)
+    #  - "1:1" etc.: forced ratio, matched to the orientation - landscape keeps
+    #                the height, portrait keeps the width
+    if selected_target_ratio in TARGET_RATIOS:
+        ratio = TARGET_RATIOS[selected_target_ratio]
+        if width >= height:
+            target_width = round(height * ratio)
+            if target_width % 2 != 0: target_width += 1
+            return target_width, height
+        target_height = round(width * ratio)
+        if target_height % 2 != 0: target_height += 1
+        return width, target_height
+    if selected_target_ratio == "Original": return width, height
+    return get_square_pixel_dimensions(width, height, sample_aspect_ratio)
+
+def get_ratio_lock_filter(width: int, height: int, sample_aspect_ratio: float, selected_target_ratio: str) -> str:
+    # ffmpeg filter that stretches frames to the Target ratio dimensions, "" when
+    # they already match. Supersedes the plain SAR correction when a ratio is forced.
+    target_width, target_height = get_target_ratio_dimensions(width, height, selected_target_ratio, sample_aspect_ratio)
+    if (target_width, target_height) == (width, height): return ""
+    return f"scale={target_width}:{target_height},setsar=1"
+
+def get_ratio_locked_video_resolution(video_path: str, selected_target_ratio: str) -> tuple[int, int]:
+    # Storage frame dimensions converted to the Target ratio dimensions
+    video_capture = opencv_VideoCapture(video_path)
+    width         = round(video_capture.get(CAP_PROP_FRAME_WIDTH))
+    height        = round(video_capture.get(CAP_PROP_FRAME_HEIGHT))
+    video_capture.release()
+    return get_target_ratio_dimensions(width, height, selected_target_ratio, get_video_sample_aspect_ratio(video_path))
+
+def resize_image_to_ratio(image: numpy_ndarray, selected_target_ratio: str) -> numpy_ndarray:
+    # Stretch an image to the Target ratio dimensions (no-op for Auto/Original and
+    # when the dimensions already match), mirroring what the video extraction
+    # filter does to each video frame
+    height, width = get_image_resolution(image)
+    target_width, target_height = get_target_ratio_dimensions(width, height, selected_target_ratio)
+    if (target_width, target_height) == (width, height): return image
+    return opencv_resize(image, (target_width, target_height), interpolation = INTER_AREA)
+
 # Media properties / thumbnail cache --------------------
 # Reading media properties and extracting thumbnails are expensive blocking calls
 # (OpenCV video open, ffprobe SAR check, full image decode) and the file cards are
@@ -1705,10 +1781,12 @@ def _drop_stale_cache_entries(cache: dict, file_path: str, cache_key: tuple) -> 
         del cache[key]
 
 def read_media_properties(file_path) -> tuple[bool, int, int, int, float]:
+    # Dimensions shown follow the Target ratio option (Auto -> SAR-corrected
+    # display size, Original -> stored size, forced ratio -> locked dimensions),
+    # matching what the pipeline will produce
+    target_ratio = app_state.preferences.target_ratio if app_state is not None else target_ratio_list[0]
     if check_if_file_is_video(file_path):
-        # Display resolution: anamorphic sources (SAR != 1:1) are shown at
-        # their displayed size, matching what the pipeline will produce
-        width, height = get_video_display_resolution(file_path)
+        width, height = get_ratio_locked_video_resolution(file_path, target_ratio)
         cap           = opencv_VideoCapture(file_path)
         num_frames    = int(cap.get(CAP_PROP_FRAME_COUNT))
         frame_rate    = sanitize_fps(cap.get(CAP_PROP_FPS))
@@ -1719,7 +1797,9 @@ def read_media_properties(file_path) -> tuple[bool, int, int, int, float]:
     return False, width, height, 0, 0.0
 
 def read_media_properties_cached(file_path) -> tuple[bool, int, int, int, float]:
-    cache_key = get_file_cache_key(file_path)
+    # The cache key includes the Target ratio: shown dimensions depend on it
+    target_ratio = app_state.preferences.target_ratio if app_state is not None else target_ratio_list[0]
+    cache_key = (*get_file_cache_key(file_path), target_ratio)
     _drop_stale_cache_entries(MEDIA_PROPERTIES_CACHE, file_path, cache_key)
     if cache_key not in MEDIA_PROPERTIES_CACHE:
         MEDIA_PROPERTIES_CACHE[cache_key] = read_media_properties(file_path)
@@ -1996,6 +2076,7 @@ def upscale_button_command() -> None:
         print(f"    Save frames: {processing_config.selected_keep_frames}")
         print(f"    Deinterlacing: {processing_config.selected_deinterlace}")
         print(f"    Target resolution: {processing_config.selected_target_resolution}")
+        print(f"    Target ratio: {processing_config.selected_target_ratio}")
         print("=" * 50)
 
         App.place_stop_button()
@@ -2026,6 +2107,7 @@ def upscale_button_command() -> None:
                 processing_config.selected_keep_frames,
                 processing_config.selected_deinterlace,
                 processing_config.selected_target_resolution,
+                processing_config.selected_target_ratio,
                 processing_config.selected_image_extension,
                 processing_config.selected_video_extension,
                 processing_config.selected_video_codec,
@@ -2056,6 +2138,7 @@ def upscale_orchestrator(
         selected_keep_frames:       bool,
         selected_deinterlace:       str,
         selected_target_resolution: str,
+        selected_target_ratio:      str,
         selected_image_extension:   str,
         selected_video_extension:   str,
         selected_video_codec:       str,
@@ -2097,6 +2180,7 @@ def upscale_orchestrator(
                     selected_keep_frames        = selected_keep_frames,
                     selected_deinterlace        = selected_deinterlace,
                     selected_target_resolution  = selected_target_resolution,
+                    selected_target_ratio       = selected_target_ratio,
                     source_root                = source_root,
                     process_log_q            = process_log_q,
                 )
@@ -2115,6 +2199,7 @@ def upscale_orchestrator(
                     input_resize_factor        = input_resize_factor,
                     output_resize_factor       = output_resize_factor,
                     selected_target_resolution = selected_target_resolution,
+                    selected_target_ratio      = selected_target_ratio,
                     selected_sharpening_amount = selected_sharpening_amount,
                     source_root                = source_root,
                 )
@@ -2136,8 +2221,9 @@ def upscale_image(
         selected_AI_model:          str,
         selected_image_extension:   str,
         input_resize_factor:        float,
-        output_resize_factor:       float,
+        output_resize_factor:      float,
         selected_target_resolution: str = "OFF",
+        selected_target_ratio:      str = "Auto",
         selected_sharpening_amount: float = 0,
         source_root:                Optional[str] = None
         ) -> None:
@@ -2150,16 +2236,27 @@ def upscale_image(
     # 2. Prepare upscaled image path
     # When a target resolution preset is set, recalculate the output scale factor
     # per image so the short side (height for landscape, width for portrait) matches
-    # the target (720p / 1080p / 2K / 4K)
+    # the target (720p / 1080p / 2K / 4K). The Target ratio option takes part: a
+    # locked ratio changes the dimensions the preset is matched against.
     target_size = get_target_resolution_height(selected_target_resolution)
     if target_size > 0:
+        ratio_width, ratio_height = get_target_ratio_dimensions(
+            starting_image.shape[1],
+            starting_image.shape[0],
+            selected_target_ratio,
+        )
         output_resize_factor = calculate_output_factor_for_target(
-            source_width        = starting_image.shape[1],
-            source_height       = starting_image.shape[0],
+            source_width        = ratio_width,
+            source_height       = ratio_height,
             input_resize_factor = input_resize_factor,
             upscale_factor      = get_model_upscale_factor(selected_AI_model),
             target_size         = target_size
         )
+
+    # 2b. Apply the Target ratio to the image itself (stretch to the locked
+    # ratio, or the SAR-corrected display size), so the saved output matches
+    # the video pipeline's aspect-ratio handling
+    starting_image = resize_image_to_ratio(starting_image, selected_target_ratio)
 
     upscaled_image_path = prepare_output_image_filename(
         image_path,
@@ -2170,6 +2267,7 @@ def upscale_image(
         selected_image_extension,
         selected_sharpening_amount,
         source_root,
+        selected_target_ratio,
     )
     os_makedirs(os_path_dirname(upscaled_image_path), exist_ok=True)
     
@@ -2281,6 +2379,7 @@ def upscale_video(
         selected_deinterlace:       str,
         source_root:                Optional[str],
         selected_target_resolution: str = "OFF",
+        selected_target_ratio:      str = "Auto",
         ) -> None:
     
     # Internal functions
@@ -2374,6 +2473,7 @@ def upscale_video(
             file_number:                int,
             raw_frames_directory:       str,
             video_path:                 str,
+            selected_target_ratio:      str = "Auto",
             ) -> list[str]:
 
         extracted_frame_count = [0]
@@ -2386,11 +2486,14 @@ def upscale_video(
         video_height        = round(video_capture.get(CAP_PROP_FRAME_HEIGHT))
         video_capture.release()
 
-        # 1b. Anamorphic sources (e.g. 720x480 DVD flagged 4:3): stretch the frames
-        #     to square pixels during extraction so the aspect ratio is preserved
-        pixel_aspect_filter = get_square_pixel_filter(video_width, video_height, get_video_sample_aspect_ratio(video_path))
+        # 1b. Aspect-ratio correction during extraction:
+        #     - Auto: stretch anamorphic frames (e.g. 720x480 DVD flagged 4:3) to
+        #       square pixels so the displayed aspect ratio is preserved
+        #     - Original: keep the stored pixels as-is
+        #     - a forced ratio (4:3 etc.): stretch the frames to that exact ratio
+        pixel_aspect_filter = get_ratio_lock_filter(video_width, video_height, get_video_sample_aspect_ratio(video_path), selected_target_ratio)
         if pixel_aspect_filter:
-            print(f"[Resolution] Anamorphic source detected, extracting frames at square pixels: {pixel_aspect_filter}")
+            print(f"[Resolution] Aspect ratio correction: {pixel_aspect_filter}")
 
         # 2. Create directory to extract frames
         os_makedirs(raw_frames_directory, mode=0o777, exist_ok=True)
@@ -2696,11 +2799,12 @@ def upscale_video(
     # 1. Preparation
     # When a target resolution preset is set, recalculate the output scale factor
     # so the short side of the video (height for landscape, width for portrait)
-    # matches the target (720p / 1080p / 2K / 4K). Display resolution is used, so
-    # anamorphic sources (SAR != 1:1) are matched at their displayed size.
+    # matches the target (720p / 1080p / 2K / 4K). The Target ratio option is part
+    # of the calculation: a locked ratio stretches the frame, so the display
+    # resolution it produces is what must be matched.
     target_size = get_target_resolution_height(selected_target_resolution)
     if target_size > 0:
-        source_width, source_height = get_video_display_resolution(video_path)
+        source_width, source_height = get_ratio_locked_video_resolution(video_path, selected_target_ratio)
         output_resize_factor = calculate_output_factor_for_target(
             source_width        = source_width,
             source_height       = source_height,
@@ -2723,6 +2827,7 @@ def upscale_video(
         selected_video_extension    = selected_video_extension,
         selected_video_codec        = selected_video_codec,
         selected_deinterlace        = selected_deinterlace,
+        selected_target_ratio       = selected_target_ratio,
         source_root                 = source_root,
     )
         
@@ -2771,6 +2876,7 @@ def upscale_video(
             file_number                = file_number,
             raw_frames_directory       = video_upscale_task.raw_frames_directory,
             video_path                 = frame_source_path,
+            selected_target_ratio      = selected_target_ratio,
         )
     
     if not extracted_frames_paths: return
@@ -3474,18 +3580,19 @@ def get_current_sharpening_amount() -> float:
 
 def get_first_file_source_dimensions() -> Optional[tuple[int, int]]:
     # Width x height of the first selected file, used to preview the auto-computed
-    # Output scale %. Videos report the display resolution (SAR-corrected).
+    # Output scale %. Videos report the display resolution (SAR-corrected); the
+    # Target ratio option is applied on top, matching the real pipeline.
     if app_state is None or not app_state.selected_file_list: return None
 
     file_path = app_state.selected_file_list[0]
     if not os_path_exists(file_path): return None
 
     if check_if_file_is_video(file_path):
-        width, height = get_video_display_resolution(file_path)
+        width, height = get_ratio_locked_video_resolution(file_path, app_state.preferences.target_ratio)
         return (width, height) if width > 0 and height > 0 else None
 
     height, width = get_image_resolution(image_read(file_path))
-    return (width, height)
+    return get_target_ratio_dimensions(width, height, app_state.preferences.target_ratio)
 
 def update_output_scale_for_target_resolution(a = None, b = None, c = None) -> None:
     # Recompute the Output scale % textbox when a target resolution preset is active.
@@ -3500,7 +3607,11 @@ def update_output_scale_for_target_resolution(a = None, b = None, c = None) -> N
 
     source_dimensions = get_first_file_source_dimensions()
     if not source_dimensions: return
-    source_width, source_height = source_dimensions
+    source_width, source_height = get_target_ratio_dimensions(
+        source_dimensions[0],
+        source_dimensions[1],
+        app_state.preferences.target_ratio,
+    )
 
     try:
         input_resize_factor = int(float(str(app_state.selected_input_resize_factor.get()))) / 100
@@ -3528,6 +3639,7 @@ def _completed_video_key(video_path: str) -> tuple:
         app_state.preferences.sharpening,
         str(app_state.selected_input_resize_factor.get()),
         str(app_state.selected_output_resize_factor.get()),
+        app_state.preferences.target_ratio,
     )
 
 def get_video_resume_progress(video_path: str) -> Optional[int]:
@@ -3545,8 +3657,16 @@ def get_video_resume_progress(video_path: str) -> Optional[int]:
     except Exception:
         return None
 
+    selected_target_ratio = app_state.preferences.target_ratio
+
     target_directory  = _build_output_path_base(video_path, selected_output_path, app_state.source_root)
-    target_directory += _build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)
+    target_directory += _build_name_suffix(
+        selected_AI_model          = selected_AI_model,
+        input_resize_factor        = input_resize_factor,
+        output_resize_factor       = output_resize_factor,
+        selected_sharpening_amount = selected_sharpening_amount,
+        selected_target_ratio      = selected_target_ratio,
+    )
     raw_frames_directory      = os_path_join(target_directory, "Raw")
     upscaled_frames_directory = os_path_join(target_directory, "Upscale")
 
@@ -3650,6 +3770,7 @@ def build_processing_config() -> Optional[ProcessingConfig]:
         selected_keep_frames       = app_state.preferences.keep_frames,
         selected_deinterlace       = app_state.preferences.deinterlace,
         selected_target_resolution = app_state.preferences.target_resolution,
+        selected_target_ratio      = app_state.preferences.target_ratio,
         selected_image_extension   = app_state.preferences.image_extension,
         selected_video_extension   = app_state.preferences.video_extension,
         selected_video_codec       = app_state.preferences.video_codec,
@@ -3817,6 +3938,7 @@ def save_user_choices_in_json() -> None:
         "default_keep_frames":          "ON" if app_state.preferences.keep_frames else "OFF",
         "default_deinterlace":          app_state.preferences.deinterlace,
         "default_target_resolution":    app_state.preferences.target_resolution,
+        "default_target_ratio":        app_state.preferences.target_ratio,
         "default_image_extension":      app_state.preferences.image_extension,
         "default_video_extension":      app_state.preferences.video_extension,
         "default_video_codec":          app_state.preferences.video_codec,
@@ -3847,6 +3969,7 @@ def load_user_preferences() -> UserPreferences:
             keep_frames          = json_data.get("default_keep_frames",          keep_frames_list[1]) == "ON",
             deinterlace          = json_data.get("default_deinterlace",          deinterlace_list[0]) if json_data.get("default_deinterlace", deinterlace_list[0]) in deinterlace_list else deinterlace_list[0],
             target_resolution    = json_data.get("default_target_resolution",    resolution_size_list[0]) if json_data.get("default_target_resolution", resolution_size_list[0]) in resolution_size_list else resolution_size_list[0],
+            target_ratio        = json_data.get("default_target_ratio",        target_ratio_list[0]) if json_data.get("default_target_ratio", target_ratio_list[0]) in target_ratio_list else target_ratio_list[0],
             image_extension      = json_data.get("default_image_extension",      image_extension_list[0]),
             video_extension      = json_data.get("default_video_extension",      video_extension_list[0]),
             video_codec          = json_data.get("default_video_codec",          video_codec_list[0]),
@@ -4428,8 +4551,8 @@ class App():
                 "  - The aspect ratio is always preserved: a 4:3 DVD upscaled to 1080p becomes 1440x1080\n"
                 "  - The preset matches the short side: the height for landscape files, the width for portrait ones\n"
                 "    (e.g. a 1080x1920 portrait video with the 1080p preset becomes 1080x1920 at Output 100%)\n"
-                "  - Anamorphic sources (e.g. DVDs stored as 720x480 but displayed as 4:3) are stretched\n"
-                "    to square pixels before upscaling, so the displayed aspect ratio is preserved\n"
+                "  - The Target ratio option (right menu) can force or override the aspect ratio;\n"
+                "    the preset calculation takes it into account\n"
                 "  - The Output scale % shown in the textbox is based on the first selected file;\n"
                 "    each file is scaled individually to the target during upscaling\n"
                 "  - Works together with the Input scale %: e.g. 1080p source + Input 50% + 4x model + 4K preset = Output 200%\n",
@@ -4437,15 +4560,42 @@ class App():
 
             open_info_messagebox("Target resolution", "Choose the final output resolution - the Output scale % is computed for you", option_list)
 
+        def open_info_target_ratio():
+            option_list = [
+                " Controls the aspect ratio of the output, giving you a hard lock on top"
+                " of the automatic SAR correction — useful when the source metadata is"
+                " missing or wrong",
+
+                " \n OPTIONS\n"
+                "  - [Auto] (default) trust the source: anamorphic files are stretched to\n"
+                "    their displayed size (e.g. a 720x480 DVD flagged 4:3 becomes 640x480)\n"
+                "  - [Original] keep the stored frame size, ignoring the SAR flag\n"
+                "  - [1:1] / [4:3] / [16:9] / [21:9] force the aspect ratio; the short side\n"
+                "    is preserved and the other side is recalculated\n",
+
+                " \n NOTES\n"
+                "  - The forced ratio adapts to the file orientation: a portrait 16:9 video\n"
+                "    is produced as 9:16\n"
+                "  - Works for both images and videos, and is part of the Target resolution\n"
+                "    preset calculation\n"
+                "  - Output folders carry a Ratio tag (e.g. _Ratio-4_3) when not Auto\n",
+            ]
+
+            open_info_messagebox("Target ratio", "Lock or override the output aspect ratio", option_list)
+
         row = ROW_TARGET_RESOLUTION
 
         place_option_background(row)
 
         info_button = App.create_info_button(open_info_target_resolution, "Target res.")
         option_menu = App.create_option_menu(App.select_target_resolution_from_menu, resolution_size_list, app_state.preferences.target_resolution)
+        ratio_info_button  = App.create_info_button(open_info_target_ratio, "Target ratio")
+        ratio_option_menu  = App.create_option_menu(App.select_target_ratio_from_menu, target_ratio_list, app_state.preferences.target_ratio)
 
         App.place_at(info_button, COL_INFO_L, row)
-        App.place_at(option_menu, COL_MENU_C, row)
+        App.place_at(option_menu, COL_MENU_L, row)
+        App.place_at(ratio_info_button, COL_INFO_R, row)
+        App.place_at(ratio_option_menu, COL_MENU_R, row)
 
     @staticmethod
     def place_output_path_textbox() -> None:
@@ -4628,6 +4778,12 @@ class App():
     @staticmethod
     def select_target_resolution_from_menu(selected_option: str) -> None:
         app_state.preferences.target_resolution = selected_option
+        update_output_scale_for_target_resolution()
+
+    @staticmethod
+    def select_target_ratio_from_menu(selected_option: str) -> None:
+        app_state.preferences.target_ratio = selected_option
+        update_file_widget(1, 2, 3)
         update_output_scale_for_target_resolution()
 
     @staticmethod
