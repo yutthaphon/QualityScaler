@@ -247,7 +247,7 @@ keep_frames_list       = [ "OFF", "ON" ]
 deinterlace_list       = [ "Auto", "OFF", "IVTC", "Yadif", "Bwdif", "W3fdif", "ESTdif" ]
 resolution_size_list   = [ "OFF", "720p", "1080p", "2K", "4K" ]
 
-# Target vertical resolution (height) for each Resolution size preset.
+# Target size (short side) for each Resolution size preset.
 # 2K follows the common consumer naming (2560x1440, QHD).
 RESOLUTION_TARGET_HEIGHTS = { "720p": 720, "1080p": 1080, "2K": 1440, "4K": 2160 }
 image_extension_list   = [ ".png", ".jpg", ".bmp", ".tiff" ]
@@ -1712,20 +1712,25 @@ def build_video_frame_extraction_command(
 # Target resolution --------------------
 
 def get_target_resolution_height(selected_target_resolution: str) -> int:
-    # Return the target vertical resolution for a preset ("720p" -> 720), 0 = OFF
+    # Return the target size for a preset ("720p" -> 720), 0 = OFF.
+    # The size is matched on the short side: the height for landscape files,
+    # the width for portrait ones.
     return RESOLUTION_TARGET_HEIGHTS.get(selected_target_resolution, 0)
 
 def calculate_output_factor_for_target(
+        source_width:        int,
         source_height:       int,
         input_resize_factor: float,
         upscale_factor:      int,
-        target_height:       int,
+        target_size:         int,
         ) -> float:
-    # Output scale factor that brings the final resolution to the target height:
-    # source_h * input% * model_x * output% = target_h  =>  output% = target / (source_h * input% * model_x)
-    ai_output_height = source_height * input_resize_factor * upscale_factor
-    if ai_output_height <= 0 or target_height <= 0: return 1.0
-    return target_height / ai_output_height
+    # Output scale factor that brings the short side of the frame to the target size
+    # (height for landscape files, width for portrait ones):
+    # short_side * input% * model_x * output% = target  =>  output% = target / (short_side * input% * model_x)
+    source_short_side    = min(source_width, source_height)
+    ai_output_short_side = source_short_side * input_resize_factor * upscale_factor
+    if ai_output_short_side <= 0 or target_size <= 0: return 1.0
+    return target_size / ai_output_short_side
 
 def get_image_resolution(image: numpy_ndarray) -> tuple:
     # Return height x width
@@ -2076,14 +2081,16 @@ def upscale_image(
 
     # 2. Prepare upscaled image path
     # When a target resolution preset is set, recalculate the output scale factor
-    # per image so the final height matches the target (720p / 1080p / 2K / 4K)
-    target_height = get_target_resolution_height(selected_target_resolution)
-    if target_height > 0:
+    # per image so the short side (height for landscape, width for portrait) matches
+    # the target (720p / 1080p / 2K / 4K)
+    target_size = get_target_resolution_height(selected_target_resolution)
+    if target_size > 0:
         output_resize_factor = calculate_output_factor_for_target(
+            source_width        = starting_image.shape[1],
             source_height       = starting_image.shape[0],
             input_resize_factor = input_resize_factor,
             upscale_factor      = get_model_upscale_factor(selected_AI_model),
-            target_height       = target_height
+            target_size         = target_size
         )
 
     upscaled_image_path = prepare_output_image_filename(
@@ -2620,17 +2627,18 @@ def upscale_video(
 
     # 1. Preparation
     # When a target resolution preset is set, recalculate the output scale factor
-    # so the final video height matches the target (720p / 1080p / 2K / 4K)
-    target_height = get_target_resolution_height(selected_target_resolution)
-    if target_height > 0:
-        video_capture = opencv_VideoCapture(video_path)
-        source_height = round(video_capture.get(CAP_PROP_FRAME_HEIGHT))
-        video_capture.release()
+    # so the short side of the video (height for landscape, width for portrait)
+    # matches the target (720p / 1080p / 2K / 4K). Display resolution is used, so
+    # anamorphic sources (SAR != 1:1) are matched at their displayed size.
+    target_size = get_target_resolution_height(selected_target_resolution)
+    if target_size > 0:
+        source_width, source_height = get_video_display_resolution(video_path)
         output_resize_factor = calculate_output_factor_for_target(
+            source_width        = source_width,
             source_height       = source_height,
             input_resize_factor = input_resize_factor,
             upscale_factor      = get_model_upscale_factor(selected_AI_model),
-            target_height       = target_height
+            target_size         = target_size
         )
         print(f"[Target resolution] {selected_target_resolution} - output factor recalculated to {round(output_resize_factor * 100)}%")
 
@@ -3422,21 +3430,20 @@ def get_current_sharpening_amount() -> float:
         "High": 0.5,
     }.get(app_state.preferences.sharpening, 0)
 
-def get_first_file_source_height() -> Optional[int]:
-    # Height of the first selected file, used to preview the auto-computed Output scale %
+def get_first_file_source_dimensions() -> Optional[tuple[int, int]]:
+    # Width x height of the first selected file, used to preview the auto-computed
+    # Output scale %. Videos report the display resolution (SAR-corrected).
     if app_state is None or not app_state.selected_file_list: return None
 
     file_path = app_state.selected_file_list[0]
     if not os_path_exists(file_path): return None
 
     if check_if_file_is_video(file_path):
-        video_capture = opencv_VideoCapture(file_path)
-        height        = round(video_capture.get(CAP_PROP_FRAME_HEIGHT))
-        video_capture.release()
-        return height if height > 0 else None
+        width, height = get_video_display_resolution(file_path)
+        return (width, height) if width > 0 and height > 0 else None
 
-    height, _width = get_image_resolution(image_read(file_path))
-    return height
+    height, width = get_image_resolution(image_read(file_path))
+    return (width, height)
 
 def update_output_scale_for_target_resolution(a = None, b = None, c = None) -> None:
     # Recompute the Output scale % textbox when a target resolution preset is active.
@@ -3449,8 +3456,9 @@ def update_output_scale_for_target_resolution(a = None, b = None, c = None) -> N
     upscale_factor = get_upscale_factor()
     if upscale_factor <= 0: return   # no AI model selected
 
-    source_height = get_first_file_source_height()
-    if not source_height: return
+    source_dimensions = get_first_file_source_dimensions()
+    if not source_dimensions: return
+    source_width, source_height = source_dimensions
 
     try:
         input_resize_factor = int(float(str(app_state.selected_input_resize_factor.get()))) / 100
@@ -3459,10 +3467,11 @@ def update_output_scale_for_target_resolution(a = None, b = None, c = None) -> N
     if input_resize_factor <= 0: return
 
     output_resize_factor = calculate_output_factor_for_target(
+        source_width        = source_width,
         source_height       = source_height,
         input_resize_factor = input_resize_factor,
         upscale_factor      = upscale_factor,
-        target_height       = target_height
+        target_size         = target_height
     )
 
     app_state.selected_output_resize_factor.set(str(round(output_resize_factor * 100)))
@@ -4375,6 +4384,10 @@ class App():
 
                 " \n NOTES\n"
                 "  - The aspect ratio is always preserved: a 4:3 DVD upscaled to 1080p becomes 1440x1080\n"
+                "  - The preset matches the short side: the height for landscape files, the width for portrait ones\n"
+                "    (e.g. a 1080x1920 portrait video with the 1080p preset becomes 1080x1920 at Output 100%)\n"
+                "  - Anamorphic sources (e.g. DVDs stored as 720x480 but displayed as 4:3) are stretched\n"
+                "    to square pixels before upscaling, so the displayed aspect ratio is preserved\n"
                 "  - The Output scale % shown in the textbox is based on the first selected file;\n"
                 "    each file is scaled individually to the target during upscaling\n"
                 "  - Works together with the Input scale %: e.g. 1080p source + Input 50% + 4x model + 4K preset = Output 200%\n",
