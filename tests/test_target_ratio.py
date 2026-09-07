@@ -102,16 +102,21 @@ class RatioLockFilterTests(unittest.TestCase):
 
 class NameSuffixRatioTests(unittest.TestCase):
     def test_auto_ratio_adds_no_tag(self):
-        suffix = quality_scaler._build_name_suffix("RealESRGANx4", 0.5, 2.0, 0.3, "Auto")
+        suffix = quality_scaler._build_name_suffix("RealESRGANx4", 0.3, "Auto")
         self.assertNotIn("_Ratio-", suffix)
 
-    def test_forced_ratio_is_tagged(self):
-        suffix = quality_scaler._build_name_suffix("RealESRGANx4", 0.5, 2.0, 0.3, "4:3")
-        self.assertIn("_Ratio-4:3", suffix)
+    def test_forced_ratio_is_tagged_with_dot_separator(self):
+        suffix = quality_scaler._build_name_suffix("RealESRGANx4", 0.3, "4:3")
+        self.assertIn("_Ratio-4.3", suffix)
 
     def test_default_ratio_is_auto(self):
-        suffix = quality_scaler._build_name_suffix("RealESRGANx4", 0.5, 2.0, 0.3)
+        suffix = quality_scaler._build_name_suffix("RealESRGANx4", 0.3)
         self.assertNotIn("_Ratio-", suffix)
+
+    def test_ratio_tag_is_windows_safe(self):
+        for ratio in ("1:1", "4:3", "16:9", "21:9"):
+            suffix = quality_scaler._build_name_suffix("RealESRGANx4", 0.3, ratio)
+            self.assertNotIn(":", suffix)
 
 
 class TargetRatioOptionListTests(unittest.TestCase):

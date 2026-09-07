@@ -46,7 +46,7 @@ class BatchPathTests(unittest.TestCase):
 
     def test_video_frame_outputs_are_separate_from_raw_frames(self):
         with tempfile.TemporaryDirectory() as directory:
-            work_directory = os.path.join(directory, "episode_RealESRGANx4_InputR50_OutputR100")
+            work_directory = os.path.join(directory, "episode_RealESRGANx4_High")
             raw_frame_path = os.path.join(work_directory, "Raw", "frame_001.jpg")
 
             self.assertEqual(
@@ -55,13 +55,11 @@ class BatchPathTests(unittest.TestCase):
                     os.path.join(work_directory, "Upscale"),
                     "RealESRGANx4",
                     0.5,
-                    1.0,
-                    0,
                 ),
                 os.path.join(
                     work_directory,
                     "Upscale",
-                    "frame_001_RealESRGANx4_InputR-50_OutputR-100.jpg",
+                    "frame_001_RealESRGANx4_High.jpg",
                 ),
             )
 

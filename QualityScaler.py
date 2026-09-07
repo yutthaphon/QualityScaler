@@ -3,7 +3,6 @@
 import sys
 from collections import deque
 from dataclasses import dataclass, field
-from functools  import cache
 from time       import sleep
 from webbrowser import open as open_browser
 
@@ -11,10 +10,10 @@ from shutil     import rmtree as remove_directory, disk_usage as shutil_disk_usa
 from timeit     import default_timer as timer
 
 from typing    import Any, Callable, ClassVar, Optional
-from threading import Thread
-from queue     import Empty, Full
+from threading import Thread, Lock, Event
+from queue     import Empty, Full, Queue
 from itertools import repeat
-from concurrent.futures import ThreadPoolExecutor
+from quality_scaler_runtime import BackgroundJobs, FileLRU, atomic_destination
 from multiprocessing import ( 
     Process        as multiprocessing_Process,
     Queue          as multiprocessing_Queue,
@@ -35,6 +34,7 @@ from os import (
     getpid   as os_getpid,
     makedirs as os_makedirs,
     listdir  as os_listdir,
+    scandir  as os_scandir,
     walk     as os_walk,
     remove   as os_remove,
     fdopen   as os_fdopen,
@@ -77,6 +77,7 @@ if sys.platform == "win32":
 from natsort import natsorted
 from psutil import (
     Process             as psutil_Process,
+    NoSuchProcess       as psutil_NoSuchProcess,
     IDLE_PRIORITY_CLASS as psutil_IDLE_PRIORITY_CLASS,
     virtual_memory      as psutil_virtual_memory,
 )
@@ -285,9 +286,12 @@ class RealtimeLogBuffer:
     def __init__(self, limit: int = 200) -> None:
         self.limit = limit
         self._entries: deque[str] = deque(maxlen=limit)
+        self.next_index = 0
 
     def append(self, entry: str) -> None:
-        if entry: self._entries.append(entry)
+        if entry:
+            self._entries.append(entry)
+            self.next_index += 1
 
     def clear(self) -> None:
         self._entries.clear()
@@ -395,6 +399,18 @@ class AppState:
     selected_file_list:            list[str] = field(default_factory=list)
     source_root:                   Optional[str] = None
     completed_video_files:         set = field(default_factory=set)
+    closing:                      bool = False
+    ui_closed:                    bool = False
+    starting:                     bool = False
+    stopping:                     bool = False
+    ui_jobs:                      Any = None
+    ui_events:                    Any = field(default_factory=Queue)
+    refresh_timer:                Any = None
+    active_config:                Any = None
+    status_thread:                Any = None
+    status_stop:                  Any = field(default_factory=Event)
+    folder_future:                Any = None
+    folder_cancel:                Any = None
 
 
 app_state: Optional[AppState] = None
@@ -460,14 +476,13 @@ _supported_file_extensions_set = {ext.lower() for ext in supported_file_extensio
 def is_supported_file(file_path: str) -> bool:
     return os_path_splitext(file_path)[1].lower() in _supported_file_extensions_set
 
-def discover_supported_files(source_root: str) -> list[str]:
+def discover_supported_files(source_root: str, cancel=None) -> list[str]:
     source_root = os_path_abspath(source_root)
-    files = [
-        os_path_join(directory, file_name)
-        for directory, _, file_names in os_walk(source_root)
-        for file_name in file_names
-        if is_supported_file(file_name)
-    ]
+    files = []
+    for directory, _, file_names in os_walk(source_root):
+        if cancel is not None and cancel.is_set():
+            return []
+        files.extend(os_path_join(directory, name) for name in file_names if is_supported_file(name))
     return natsorted(files, key = lambda path: os_path_relpath(path, source_root).casefold())
 
 
@@ -982,7 +997,9 @@ class AI_upscale:
         accumulator = accumulator[ramp : ramp + t_height, ramp : ramp + t_width]
         weights     = weights[ramp : ramp + t_height, ramp : ramp + t_width]
         numpy_maximum(weights, 1e-6, out = weights)
-        blended = accumulator / weights + 0.5
+        accumulator /= weights
+        accumulator += 0.5
+        blended = accumulator
 
         if image_mode == "Grayscale":
             return blended[:, :, 0].astype(uint8)
@@ -1012,20 +1029,17 @@ class AI_upscale:
 
 def _build_name_suffix(
         selected_AI_model:          str,
-        input_resize_factor:        float,
-        output_resize_factor:       float,
         selected_sharpening_amount: float,
         selected_target_ratio:      str = "Auto",
         ) -> str:
 
+    # ":" is replaced with "." so the suffix stays a valid Windows path component
     suffix  = f"_{selected_AI_model}"
-    suffix += f"_InputR-{str(int(input_resize_factor * 100))}"
-    suffix += f"_OutputR-{str(int(output_resize_factor * 100))}"
-    if selected_target_ratio != "Auto": suffix += f"_Ratio-{selected_target_ratio}"
+    if selected_target_ratio != "Auto": suffix += f"_Ratio-{selected_target_ratio.replace(':', '.')}"
 
     match selected_sharpening_amount:
-        case 0.3: suffix += "_Sharpening-Low"
-        case 0.5: suffix += "_Sharpening-High"
+        case 0.3: suffix += "_Low"
+        case 0.5: suffix += "_High"
 
     return suffix
 
@@ -1052,15 +1066,13 @@ def build_upscaled_frame_path(
         raw_frame_path:         str,
         upscaled_frames_folder: str,
         selected_AI_model:      str,
-        input_resize_factor:    float,
-        output_resize_factor:   float,
         selected_sharpening_amount: float
         ) -> str:
 
     frame_name, _ = os_path_splitext(os_path_basename(raw_frame_path))
     return os_path_join(
         upscaled_frames_folder,
-        f"{frame_name}{_build_name_suffix(selected_AI_model, input_resize_factor, output_resize_factor, selected_sharpening_amount)}.jpg"
+        f"{frame_name}{_build_name_suffix(selected_AI_model, selected_sharpening_amount)}.jpg"
     )
 
 class VideoUpscaleTask:
@@ -1109,8 +1121,6 @@ class VideoUpscaleTask:
             video_path                 = self.video_path,
             selected_output_path       = self.selected_output_path,
             selected_AI_model          = self.selected_AI_model,
-            input_resize_factor        = self.input_resize_factor,
-            output_resize_factor       = self.output_resize_factor,
             selected_sharpening_amount = self.selected_sharpening_amount,
             selected_deinterlace       = self.selected_deinterlace,
             selected_target_ratio      = self.selected_target_ratio,
@@ -1124,8 +1134,6 @@ class VideoUpscaleTask:
             video_path                 = self.video_path,
             selected_output_path       = self.selected_output_path,
             selected_AI_model          = self.selected_AI_model,
-            input_resize_factor        = self.input_resize_factor,
-            output_resize_factor       = self.output_resize_factor,
             selected_video_extension   = self.selected_video_extension,
             selected_sharpening_amount = self.selected_sharpening_amount,
             selected_deinterlace       = self.selected_deinterlace,
@@ -1182,8 +1190,6 @@ class VideoUpscaleTask:
         self.upscaled_frame_paths = self._prepare_upscaled_frame_path_list(
             extracted_frames_paths     = self.extracted_frames_paths,
             selected_AI_model          = self.selected_AI_model,
-            input_resize_factor        = self.input_resize_factor,
-            output_resize_factor       = self.output_resize_factor,
             selected_sharpening_amount = self.selected_sharpening_amount
         )
 
@@ -1246,8 +1252,6 @@ class VideoUpscaleTask:
             video_path:                 str, 
             selected_output_path:       str,
             selected_AI_model:          str, 
-            input_resize_factor:        float, 
-            output_resize_factor:      float,
             selected_video_extension:   str,
             selected_sharpening_amount: float,
             selected_deinterlace:       str,
@@ -1260,8 +1264,6 @@ class VideoUpscaleTask:
             video_path                 = video_path,
             selected_output_path       = selected_output_path,
             selected_AI_model          = selected_AI_model,
-            input_resize_factor        = input_resize_factor,
-            output_resize_factor       = output_resize_factor,
             selected_sharpening_amount = selected_sharpening_amount,
             selected_deinterlace       = selected_deinterlace,
             selected_target_ratio      = selected_target_ratio,
@@ -1275,8 +1277,6 @@ class VideoUpscaleTask:
             video_path:                 str, 
             selected_output_path:       str,
             selected_AI_model:          str, 
-            input_resize_factor:        float, 
-            output_resize_factor:      float,
             selected_sharpening_amount: float,
             selected_deinterlace:       str,
             selected_target_ratio:      str = "Auto",
@@ -1286,12 +1286,10 @@ class VideoUpscaleTask:
         output_path  = _build_output_path_base(video_path, selected_output_path, source_root)
         output_path += _build_name_suffix(
             selected_AI_model          = selected_AI_model,
-            input_resize_factor        = input_resize_factor,
-            output_resize_factor       = output_resize_factor,
             selected_sharpening_amount = selected_sharpening_amount,
             selected_target_ratio      = selected_target_ratio,
         )
-        output_path += f"_Deinterlace-{selected_deinterlace}"
+        output_path += f"_{selected_deinterlace}" if selected_deinterlace != "OFF" else ""
 
         return output_path
 
@@ -1299,8 +1297,6 @@ class VideoUpscaleTask:
             self,
             frame_path:                 str, 
             selected_AI_model:          str, 
-            input_resize_factor:        float, 
-            output_resize_factor:       float,
             selected_sharpening_amount: float
             ) -> str:
                 
@@ -1308,17 +1304,13 @@ class VideoUpscaleTask:
             frame_path,
             self.upscaled_frames_directory,
             selected_AI_model,
-            input_resize_factor,
-            output_resize_factor,
             selected_sharpening_amount,
         )
 
     def _prepare_upscaled_frame_path_list(
             self,
             extracted_frames_paths:     list[str],
-            selected_AI_model:          str,
-            input_resize_factor:        int,
-            output_resize_factor:       str,
+            selected_AI_model:         str,
             selected_sharpening_amount: float
             ) -> list[str]:
 
@@ -1326,8 +1318,6 @@ class VideoUpscaleTask:
             self._prepare_output_video_frame_filename(
                 frame_path,
                 selected_AI_model,
-                input_resize_factor,
-                output_resize_factor,
                 selected_sharpening_amount
             )
             for frame_path in extracted_frames_paths
@@ -1385,9 +1375,12 @@ class VideoUpscaleTask:
 
 # File / Media Utils -------------------
 
-def image_read(file_path: str) -> numpy_ndarray: 
+def image_read(file_path: str) -> numpy_ndarray:
     with open(file_path, 'rb') as file:
-        return opencv_imdecode(numpy_frombuffer(file.read(), uint8), IMREAD_UNCHANGED)
+        decoded = opencv_imdecode(numpy_frombuffer(file.read(), uint8), IMREAD_UNCHANGED)
+    if decoded is None:
+        raise ValueError(f"Cannot decode image: {file_path}")
+    return decoded
     
 def image_write(
         file_path: str, 
@@ -1404,7 +1397,11 @@ def image_write(
     elif ext_lower == ".png":
         encode_params = [IMWRITE_PNG_COMPRESSION, png_compression]
 
-    opencv_imencode(file_extension, file_data, encode_params)[1].tofile(file_path)
+    success, encoded = opencv_imencode(file_extension, file_data, encode_params)
+    if not success:
+        raise OSError(f"Cannot encode image: {file_path}")
+    with atomic_destination(file_path) as temporary:
+        encoded.tofile(temporary)
 
 def delete_file(file_path: str) -> None:
     if os_path_exists(file_path): os_remove(file_path)
@@ -1416,8 +1413,6 @@ def prepare_output_image_filename(
         image_path:                 str, 
         selected_output_path:       str,
         selected_AI_model:          str, 
-        input_resize_factor:        float, 
-        output_resize_factor:      float,
         selected_image_extension:   str,
         selected_sharpening_amount: float,
         source_root:                Optional[str] = None,
@@ -1427,8 +1422,6 @@ def prepare_output_image_filename(
     output_path  = _build_output_path_base(image_path, selected_output_path, source_root)
     output_path += _build_name_suffix(
         selected_AI_model          = selected_AI_model,
-        input_resize_factor        = input_resize_factor,
-        output_resize_factor       = output_resize_factor,
         selected_sharpening_amount = selected_sharpening_amount,
         selected_target_ratio      = selected_target_ratio,
     )
@@ -1554,6 +1547,24 @@ def is_cuda_deinterlace_filter(deinterlace_filter: str) -> bool:
 # Filter used by the "Auto" mode when interlacing is detected (fast, good quality)
 AUTO_DEINTERLACE_FILTER = DEINTERLACE_FILTERS["Bwdif"]
 
+ACTIVE_PROBES = set()
+PROBE_LOCK = Lock()
+
+
+def communicate_with_cleanup(process, timeout):
+    with PROBE_LOCK:
+        ACTIVE_PROBES.add(process)
+    try:
+        return process.communicate(timeout=timeout)
+    except subprocess_TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    finally:
+        with PROBE_LOCK:
+            ACTIVE_PROBES.discard(process)
+
+
 def is_video_interlaced(video_path: str) -> bool:
     # Detect interlaced video, supporting DVD / VCD / Blu-ray and generic files.
     startupinfo = get_subprocess_startupinfo()
@@ -1569,7 +1580,7 @@ def is_video_interlaced(video_path: str) -> bool:
             stderr     = subprocess_DEVNULL,
             startupinfo = startupinfo,
         )
-        probe_output, _ = probe_process.communicate(timeout = 30)
+        probe_output, _ = communicate_with_cleanup(probe_process, 30)
         field_order     = probe_output.decode(errors = "ignore").strip().strip(",")
 
         if field_order in ("tt", "bb", "tb", "bt"): return True
@@ -1588,7 +1599,7 @@ def is_video_interlaced(video_path: str) -> bool:
             stderr     = subprocess_PIPE,
             startupinfo = startupinfo,
         )
-        _, idet_output = idet_process.communicate(timeout = 120)
+        _, idet_output = communicate_with_cleanup(idet_process, 120)
         idet_output    = idet_output.decode(errors = "ignore") if idet_output else ""
 
         for line in idet_output.splitlines():
@@ -1681,7 +1692,7 @@ def get_video_sample_aspect_ratio(video_path: str) -> float:
             stderr      = subprocess_DEVNULL,
             startupinfo = get_subprocess_startupinfo(),
         )
-        probe_output, _ = probe_process.communicate(timeout = 30)
+        probe_output, _ = communicate_with_cleanup(probe_process, 10)
         value           = probe_output.decode(errors = "ignore").strip().strip(",").split(",")[0]
         if ":" in value:
             numerator, _, denominator = value.partition(":")
@@ -1768,15 +1779,19 @@ def resize_image_to_ratio(image: numpy_ndarray, selected_target_ratio: str) -> n
 # fully re-rendered whenever a file is added or removed. Results are cached per
 # file (path + modification time) so re-rendering the list stays responsive.
 
-MEDIA_PROPERTIES_CACHE: dict = {}
-FILE_ICON_CACHE:        dict = {}
+MEDIA_PROPERTIES_CACHE = FileLRU()
+FILE_ICON_CACHE = FileLRU()
+PREVIEW_CACHE = FileLRU()
+PREVIEW_CACHE_LOCK = Lock()
 
 def get_file_cache_key(file_path: str) -> tuple:
     try:    return file_path, os_path_getmtime(file_path)
     except OSError: return file_path, 0.0
 
 def _drop_stale_cache_entries(cache: dict, file_path: str, cache_key: tuple) -> None:
-    # Discard cached values for the same file that were read before its last modification
+    if isinstance(cache, FileLRU):
+        cache.drop_stale(file_path, cache_key)
+        return
     for key in [key for key in cache if key[0] == file_path and key != cache_key]:
         del cache[key]
 
@@ -1819,8 +1834,8 @@ def build_file_icon(file_path):
         source_icon = opencv_cvtColor(image_read(file_path), COLOR_BGR2RGB)
 
     ratio       = min(max_size / source_icon.shape[0], max_size / source_icon.shape[1])
-    new_width   = int(source_icon.shape[1] * ratio)
-    new_height  = int(source_icon.shape[0] * ratio)
+    new_width   = max(1, int(source_icon.shape[1] * ratio))
+    new_height  = max(1, int(source_icon.shape[0] * ratio))
     source_icon = opencv_resize(source_icon,(new_width, new_height))
     ctk_icon    = CTkImage(pillow_image_fromarray(source_icon, mode="RGB"), size = (new_width, new_height))
 
@@ -1832,6 +1847,60 @@ def get_file_icon_cached(file_path):
     if cache_key not in FILE_ICON_CACHE:
         FILE_ICON_CACHE[cache_key] = build_file_icon(file_path)
     return FILE_ICON_CACHE[cache_key]
+
+
+def load_media_preview(file_path):
+    """Read one source off the UI thread. Return only plain data and PIL pixels."""
+    key = get_file_cache_key(file_path)
+    with PREVIEW_CACHE_LOCK:
+        if key in PREVIEW_CACHE:
+            return PREVIEW_CACHE[key]
+    is_video = check_if_file_is_video(file_path)
+    if is_video:
+        cap = opencv_VideoCapture(file_path)
+        try:
+            width = round(cap.get(CAP_PROP_FRAME_WIDTH))
+            height = round(cap.get(CAP_PROP_FRAME_HEIGHT))
+            frames = int(cap.get(CAP_PROP_FRAME_COUNT))
+            fps = sanitize_fps(cap.get(CAP_PROP_FPS))
+            ok, pixels = cap.read()
+            if not ok:
+                pixels = None
+        finally:
+            cap.release()
+        sar = get_video_sample_aspect_ratio(file_path)
+    else:
+        pixels = image_read(file_path)
+        height, width = pixels.shape[:2]
+        frames, fps, sar = 0, 0.0, 1.0
+    if width <= 0 or height <= 0:
+        raise ValueError("Cannot read media dimensions")
+    icon = None
+    if pixels is not None:
+        scale = min(60 / pixels.shape[1], 60 / pixels.shape[0])
+        pixels = opencv_resize(pixels, (max(1, round(pixels.shape[1] * scale)),
+                                       max(1, round(pixels.shape[0] * scale))))
+        if pixels.dtype != uint8:
+            pixels = numpy_clip(pixels / (257 if str(pixels.dtype) == "uint16" else 1), 0, 255).astype(uint8)
+        pixels = opencv_cvtColor(pixels, COLOR_GRAY2RGB if pixels.ndim == 2 else COLOR_BGR2RGB)
+        icon = pillow_image_fromarray(pixels)
+    data = dict(key=key, is_video=is_video, width=width, height=height,
+                frames=frames, fps=fps, sar=sar, icon=icon)
+    with PREVIEW_CACHE_LOCK:
+        PREVIEW_CACHE[key] = data
+    return data
+
+
+def scan_resume_progress(target_directory):
+    counts = []
+    for name in ("Raw", "Upscale"):
+        try:
+            with os_scandir(os_path_join(target_directory, name)) as entries:
+                counts.append(sum(1 for entry in entries if entry.name.endswith(".jpg")
+                                  and (name != "Raw" or entry.name.startswith("frame_"))))
+        except OSError:
+            return None
+    return min(100, int(counts[1] / counts[0] * 100)) if counts[0] else None
 
 def build_video_frame_extraction_command(
         video_path:          str,
@@ -1957,104 +2026,213 @@ def show_completion_notification() -> None:
         print(f"[{app_name}] Warning: could not show system notification: {e}")
 
 def check_upscale_steps() -> None:
-    sleep(1)
-
-    while True:
-        actual_step = app_state.process_status_q.get()
-        print(f"[{app_name}] check_upscale_steps - {actual_step}")
-
-        if actual_step == CLOSE_APP_STATUS: break
-
-        elif actual_step == STOP_STATUS:
-            allow_sleep()
-            app_state.info_message.set("Upscaling stopped")
-            App.place_upscale_button()
-            app_state.window.after(0, lambda: update_file_widget(1, 2, 3))
-            if app_state.file_widget is not None: app_state.window.after(0, app_state.file_widget.clear_active_highlight)
-            break
-
-        elif actual_step == COMPLETED_STATUS:
-            allow_sleep()
-            app_state.info_message.set("All files completed! :)")
-            for file_path in app_state.selected_file_list:
-                if check_if_file_is_video(file_path): app_state.completed_video_files.add(_completed_video_key(file_path))
-            stop_upscale_process()
-            App.place_upscale_button()
-            app_state.window.after(0, lambda: update_file_widget(1, 2, 3))
-            if app_state.file_widget is not None: app_state.window.after(0, app_state.file_widget.clear_active_highlight)
-            show_completion_notification()
-            break
-
-        elif ERROR_STATUS in actual_step:
-            allow_sleep()
-            app_state.info_message.set("Error while upscaling :(")
-            error_to_show = actual_step.replace(ERROR_STATUS, "")
-            show_error_message(error_to_show.strip())
-            stop_upscale_process()
-            App.place_upscale_button()
-            app_state.window.after(0, lambda: update_file_widget(1, 2, 3))
-            if app_state.file_widget is not None: app_state.window.after(0, app_state.file_widget.clear_active_highlight)
-            break
-
-        else:
-            app_state.info_message.set(actual_step)
-            try:
-                file_number = int(actual_step.split('.')[0])
-                if app_state.file_widget is not None:
-                    app_state.window.after(0, lambda fn = file_number: app_state.file_widget.highlight_active_file(fn))
-            except (ValueError, IndexError):
-                pass
-
-        sleep(0.25)
+    # This thread never calls Tk. Terminal events are never discarded.
+    while not app_state.status_stop.is_set():
+        try:
+            actual_step = app_state.process_status_q.get(timeout=0.2)
+        except Empty:
+            process = app_state.process_upscale_orchestrator
+            if process is not None and process.exitcode is not None:
+                app_state.ui_events.put(("status", f"{ERROR_STATUS} Worker exited without a final status (code {process.exitcode})"))
+                return
+            continue
+        except (EOFError, OSError):
+            return
+        if isinstance(actual_step, dict):
+            app_state.ui_events.put(("file_completed", actual_step))
+            continue
+        app_state.ui_events.put(("status", actual_step))
+        if actual_step in (CLOSE_APP_STATUS, STOP_STATUS, COMPLETED_STATUS) or ERROR_STATUS in actual_step:
+            return
         
 def write_process_status(process_status_q: multiprocessing_Queue, step: str) -> None:
     print(step)
-    while not process_status_q.empty(): process_status_q.get()
-    process_status_q.put(f"{step}")
+    process_status_q.put(str(step))
+
+
+def handle_ui_event(kind, payload):
+    if kind == "file_completed":
+        if app_state.active_config is not None:
+            key = _completed_video_key(payload["path"], app_state.active_config, payload["source_key"])
+            app_state.completed_video_files.add(key)
+        return
+    if kind == "cleanup_failed":
+        app_state.stopping = False
+        app_state.info_message.set(f"Cleanup incomplete; press STOP to retry: {payload}")
+        return
+    if kind == "stopped":
+        app_state.process_upscale_orchestrator = None
+        app_state.stopping = False
+        if app_state.status_thread is not None:
+            app_state.status_thread.join(timeout=0)
+        allow_sleep()
+        if app_state.closing:
+            cancel_tk_callbacks(app_state.window)
+            app_state.ui_closed = True
+            app_state.window.destroy()
+            return
+        App.place_upscale_button()
+        if app_state.file_widget is not None:
+            app_state.file_widget.resume_cache.clear()
+            for future in app_state.file_widget.pending_resume.values():
+                future.cancel()
+            app_state.file_widget.pending_resume.clear()
+            app_state.file_widget.clear_active_highlight()
+        update_file_widget(1, 2, 3)
+        if payload == COMPLETED_STATUS:
+            app_state.info_message.set("All files completed! :)")
+            show_completion_notification()
+        elif ERROR_STATUS in payload:
+            app_state.info_message.set("Error while upscaling :(")
+            show_error_message(payload.replace(ERROR_STATUS, "").strip())
+        else:
+            app_state.info_message.set("Upscaling stopped")
+        return
+    if app_state.closing or app_state.stopping:
+        return
+    if payload == COMPLETED_STATUS or payload == STOP_STATUS or ERROR_STATUS in payload:
+        stop_upscale_process(payload)
+        return
+    app_state.info_message.set(payload)
+    try:
+        number = int(payload.split('.')[0])
+        if app_state.file_widget is not None:
+            app_state.file_widget.highlight_active_file(number)
+            if 0 < number <= len(app_state.file_widget.file_list):
+                path = app_state.file_widget.file_list[number - 1]
+                app_state.file_widget.resume_cache.pop(_completed_video_key(path), None)
+    except (ValueError, IndexError):
+        pass
 
 def poll_realtime_logs() -> None:
     if app_state is None or app_state.process_log_q is None: return
-
+    started = timer()
+    for _ in range(50):
+        try:
+            kind, payload = app_state.ui_events.get_nowait()
+        except Empty:
+            break
+        handle_ui_event(kind, payload)
+        if app_state.ui_closed:
+            return
+        if timer() - started > 0.004:
+            break
     updated = False
-    while True:
+    for _ in range(80):
         try:
             app_state.log_buffer.append(app_state.process_log_q.get_nowait())
             updated = True
         except Empty:
+            break
+        if timer() - started > 0.008:
             break
 
     if updated and app_state.log_window is not None and app_state.log_window.winfo_exists():
         app_state.log_window.render()
     app_state.window.after(100, poll_realtime_logs)
 
-def stop_upscale_process() -> None:
-    print(f"[{app_name}] stop_upscale_process - setting upscale process stop event")
-    app_state.event_stop_upscale_process.set()
-
-    sleep(1)
-
-    if app_state.process_upscale_orchestrator is not None:
-        print(f"[{app_name}] stop_upscale_process - waiting for upscale orchestrator to terminate")
-        app_state.process_upscale_orchestrator.kill()
-        app_state.process_upscale_orchestrator = None
-        print(f"[{app_name}] stop_upscale_process - upscale orchestrator terminated")
-
-    try:
-        while not app_state.video_frames_and_info_q.empty(): app_state.video_frames_and_info_q.get_nowait()
-        print(f"[{app_name}] stop_upscale_process - video_frames_and_info_q cleared")
-    except Exception as e:
-        print(f"[{app_name}] Warning clearing video_frames_and_info_q: {e}")
-
-    write_process_status(app_state.process_status_q, STOP_STATUS)
-    app_state.event_stop_upscale_process.clear()
+def stop_upscale_process(reason=STOP_STATUS) -> None:
+    if app_state.stopping:
+        return
+    app_state.stopping = True
+    app_state.status_stop.set()
+    app_state.info_message.set("Closing…" if app_state.closing else "Finalizing…" if reason == COMPLETED_STATUS else "Stopping…")
+    process = app_state.process_upscale_orchestrator
+    def finish():
+        children = []
+        try:
+            if app_state.closing:
+                with PROBE_LOCK:
+                    probes = tuple(ACTIVE_PROBES)
+                for probe in probes:
+                    if probe.poll() is None:
+                        probe.kill()
+                        probe.wait(timeout=3)
+            if process is not None and process.is_alive():
+                try:
+                    children = psutil_Process(process.pid).children(recursive=True)
+                except psutil_NoSuchProcess:
+                    pass
+            app_state.event_stop_upscale_process.set()
+            if process is not None and process.pid is not None:
+                process.join(timeout=5)
+                if process.is_alive():
+                    try:
+                        children.extend(psutil_Process(process.pid).children(recursive=True))
+                    except psutil_NoSuchProcess:
+                        pass
+                    process.kill()
+                    process.join(timeout=3)
+                if process.is_alive():
+                    raise RuntimeError("Upscale process has not exited")
+            for child in children:
+                try:
+                    if child.is_running():
+                        child.kill()
+                        child.wait(timeout=3)
+                except psutil_NoSuchProcess:
+                    pass
+            for queue in (app_state.process_status_q, app_state.video_frames_and_info_q):
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except Empty:
+                        break
+            if app_state.status_thread is not None:
+                app_state.status_thread.join(timeout=1)
+                if app_state.status_thread.is_alive():
+                    raise RuntimeError("Status monitor has not exited")
+            if process is not None:
+                process.close()
+        except Exception as error:
+            app_state.ui_events.put(("cleanup_failed", str(error)))
+        else:
+            app_state.ui_events.put(("stopped", reason))
+    Thread(target=finish, name="upscale-cleanup", daemon=True).start()
 
 def stop_button_command() -> None:
     stop_upscale_process()
 
 # ORCHESTRATOR
 
-def upscale_button_command() -> None: 
+def upscale_button_command() -> None:
+    if app_state.closing or app_state.starting or app_state.stopping or app_state.process_upscale_orchestrator is not None:
+        return
     processing_config = build_processing_config()
+    if processing_config is None:
+        return
+    app_state.starting = True
+    app_state.info_message.set("Checking output drive…")
+    try:
+        future = app_state.ui_jobs.submit(check_disk_space, processing_config.selected_output_path, processing_config.selected_file_list)
+    except Full:
+        app_state.starting = False
+        app_state.info_message.set("Preview workers busy; try UPSCALE again")
+        return
+    def collect():
+        if app_state.closing:
+            future.cancel()
+            app_state.starting = False
+            return
+        if not future.done():
+            app_state.window.after(50, collect)
+            return
+        app_state.starting = False
+        try:
+            warning = future.result()
+            if warning is not None:
+                app_state.info_message.set("Not enough disk space")
+                show_disk_space_error_message(warning)
+            else:
+                start_upscale(processing_config)
+        except Exception as error:
+            app_state.info_message.set(f"Cannot start: {error}")
+            if app_state.process_upscale_orchestrator is not None:
+                stop_upscale_process(f"{ERROR_STATUS} {error}")
+    app_state.window.after(50, collect)
+
+
+def start_upscale(processing_config):
 
     if processing_config is not None:
         app_state.info_message.set("Loading")
@@ -2081,10 +2259,10 @@ def upscale_button_command() -> None:
 
         App.place_stop_button()
 
+        app_state.active_config = processing_config
         app_state.completed_video_files.clear()
+        app_state.status_stop.clear()
         app_state.event_stop_upscale_process.clear()
-        while not app_state.process_status_q.empty():        app_state.process_status_q.get_nowait()
-        while not app_state.video_frames_and_info_q.empty(): app_state.video_frames_and_info_q.get_nowait()
 
         app_state.process_upscale_orchestrator = multiprocessing_Process(
             target = upscale_orchestrator,
@@ -2116,7 +2294,8 @@ def upscale_button_command() -> None:
         prevent_sleep()
         app_state.process_upscale_orchestrator.start()
 
-        Thread(target = check_upscale_steps).start()
+        app_state.status_thread = Thread(target=check_upscale_steps, name="upscale-status", daemon=True)
+        app_state.status_thread.start()
 
 def upscale_orchestrator(
         process_status_q:           multiprocessing_Queue,
@@ -2154,6 +2333,7 @@ def upscale_orchestrator(
             if event_stop_upscale_process.is_set(): return
             
             file_path   = selected_file_list[file_number]
+            source_key = get_file_cache_key(file_path)
             file_number = file_number + 1
 
             if not os_path_exists(file_path):
@@ -2203,6 +2383,9 @@ def upscale_orchestrator(
                     selected_sharpening_amount = selected_sharpening_amount,
                     source_root                = source_root,
                 )
+
+            if check_if_file_is_video(file_path) and not event_stop_upscale_process.is_set():
+                process_status_q.put(dict(path=file_path, source_key=source_key))
 
         if not event_stop_upscale_process.is_set(): write_process_status(process_status_q, f"{COMPLETED_STATUS}")
 
@@ -2262,8 +2445,6 @@ def upscale_image(
         image_path,
         selected_output_path,
         selected_AI_model,
-        input_resize_factor,
-        output_resize_factor,
         selected_image_extension,
         selected_sharpening_amount,
         source_root,
@@ -2329,6 +2510,14 @@ def upscale_video_frames_async(
         # Upscale frame
         starting_frame = image_read(input_path)
         upscaled_frame = AI_instance.AI_orchestration(starting_frame)
+        if event_stop_upscale_process.is_set():
+            break
+        # Keep image pixels in their owning worker; IPC carries only completion data.
+        if video_upscale_task.selected_sharpening_amount > 0:
+            sharpen_and_save(output_path, upscaled_frame, video_upscale_task.selected_sharpening_amount)
+        else:
+            image_write(output_path, upscaled_frame, jpeg_quality=90)
+        del starting_frame, upscaled_frame
 
         # Calculate processing time
         end_timer       = timer()
@@ -2336,11 +2525,10 @@ def upscale_video_frames_async(
 
         # Add things in queue
         success = False
-        while not success:
+        while not success and not event_stop_upscale_process.is_set():
             try:
                 video_frames_and_info_q.put_nowait(
                     {
-                        "upscaled_frame":      upscaled_frame,
                         "upscaled_frame_path": output_path,
                         "processing_time":     processing_time
                     }
@@ -2586,78 +2774,28 @@ def upscale_video(
             video_upscale_task:              VideoUpscaleTask,
             ) -> None:
 
-        opencv_setNumThreads(1)
-
-        def _internal_save_frame(
-                upscaled_frame:             numpy_ndarray, 
-                upscaled_frame_path:        str, 
-                selected_sharpening_amount: float
-                ) -> None:
-
-            if selected_sharpening_amount > 0:
-                sharpen_and_save(upscaled_frame_path, upscaled_frame, selected_sharpening_amount)
-            else:
-                image_write(upscaled_frame_path, upscaled_frame, jpeg_quality=90)
-
-
-        # Main
+        # Workers have already saved each frame successfully before publishing it.
         current_upscaled_count = video_upscale_task.upscaled_frames_counter
-        UPDATE_STATUS_TIMER    = 3.0
         processing_times_list  = []
         last_update_time       = timer()
-
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            threads_set = set()
-
-            while True:
-                if event_stop_upscale_process.is_set():
-                    print("[Frames saving thread] terminating by upscale stop event")
-                    break
-
-                if event_stop_upscaled_save_thread.is_set() and video_frames_and_info_q.empty():
-                    print("[Frames saving thread] terminating correctly")
-                    break
-
+        try:
+            while not event_stop_upscale_process.is_set():
                 try:
-                    item = video_frames_and_info_q.get_nowait()
-                    current_upscaled_count += 1
+                    item = video_frames_and_info_q.get(timeout=0.1)
                 except Empty:
-                    sleep(0.1)
+                    if event_stop_upscaled_save_thread.is_set():
+                        break
                     continue
-
-                upscaled_frame      = item["upscaled_frame"]
-                upscaled_frame_path = item["upscaled_frame_path"]
-                processing_time     = item["processing_time"]
-
-                processing_times_list.append(processing_time/video_upscale_task.optimal_threads_number)
-
-                threads_set.add(
-                    executor.submit(
-                        _internal_save_frame,
-                        upscaled_frame,
-                        upscaled_frame_path,
-                        video_upscale_task.selected_sharpening_amount
-                    )
-                )
-
-                now = timer()
-                if now - last_update_time >= UPDATE_STATUS_TIMER:
-                    last_update_time = now
-
-                    done_threads = {t for t in threads_set if t.done()}
-                    threads_set -= done_threads
-
-                    if processing_times_list:
-                        update_video_process_status(
-                            process_status_q        = process_status_q,
-                            file_number             = file_number,
-                            upscaled_count          = current_upscaled_count,
-                            extracted_frames_number = video_upscale_task.extracted_frames_number,
-                            average_processing_time = numpy_mean(processing_times_list)
-                        )
-                        processing_times_list = []
-
-            for t in threads_set: t.result()
+                current_upscaled_count += 1
+                processing_times_list.append(item["processing_time"] / video_upscale_task.optimal_threads_number)
+                if timer() - last_update_time >= 3.0:
+                    last_update_time = timer()
+                    update_video_process_status(process_status_q, file_number, current_upscaled_count,
+                                                video_upscale_task.extracted_frames_number, numpy_mean(processing_times_list))
+                    processing_times_list.clear()
+        except Exception as error:
+            video_upscale_task.progress_error = error
+            event_stop_upscale_process.set()
 
     def upscale_video_frames(
             process_status_q:           multiprocessing_Queue,
@@ -2667,6 +2805,8 @@ def upscale_video(
             video_upscale_task:         VideoUpscaleTask
             ) -> None:
 
+        if event_stop_upscale_process.is_set():
+            return
         event_stop_upscaled_save_thread = multiprocessing_Event()
         
         if not video_upscale_task.frames_paths_to_upscale: # 2. NO frames to upscale - set event save thread to close and exit
@@ -2689,24 +2829,28 @@ def upscale_video(
             
             # 4. Start upscale process
             write_process_status(process_status_q, f"{file_number}. Upscaling video ({video_upscale_task.optimal_threads_number} threads)")
-            with multiprocessing_Pool(video_upscale_task.optimal_threads_number) as pool:
-                pool.starmap(
-                    upscale_video_frames_async,
-                    zip(
-                        repeat(process_log_q),
-                        repeat(video_frames_and_info_q),
-                        repeat(event_stop_upscale_process),
-                        repeat(video_upscale_task),
-                        video_upscale_task.frames_chunks_list,
+            try:
+                with multiprocessing_Pool(video_upscale_task.optimal_threads_number) as pool:
+                    pool.starmap(
+                        upscale_video_frames_async,
+                        zip(
+                            repeat(process_log_q),
+                            repeat(video_frames_and_info_q),
+                            repeat(event_stop_upscale_process),
+                            repeat(video_upscale_task),
+                            video_upscale_task.frames_chunks_list,
+                        )
                     )
-                )
+            finally:
+                event_stop_upscaled_save_thread.set()
+                save_thread.join(timeout=30)
 
             # 5. Signal save thread and wait for it to finish
             write_process_status(process_status_q, f"{file_number}. Finalizing upscaling")
-            event_stop_upscaled_save_thread.set()
-            save_thread.join(timeout=30)
             if save_thread.is_alive():
-                print(f"[{file_number}] Warning: save thread did not finish within timeout")
+                raise RuntimeError("Frame completion monitor did not finish")
+            if getattr(video_upscale_task, "progress_error", None) is not None:
+                raise RuntimeError(f"Frame completion monitor failed: {video_upscale_task.progress_error}")
 
     def encode_upscaled_video(process_status_q: multiprocessing_Queue, video_upscale_task: VideoUpscaleTask) -> None:
 
@@ -2718,9 +2862,10 @@ def upscale_video(
         # Create a file .txt with all upscaled video frames paths || this file is essential
         with os_fdopen(os_open(video_upscale_task.ffmpeg_txt_file_path, os_O_WRONLY | os_O_CREAT, 0o777), 'w', encoding="utf-8") as txt:
             for frame_path in video_upscale_task.upscaled_frame_paths:
-                if os_path_exists(frame_path):
-                    safe_path = os_path_abspath(frame_path).replace("\\", "/").replace("'", "'\\''")
-                    txt.write(f"file '{safe_path}' \n")
+                if not os_path_exists(frame_path):
+                    raise RuntimeError(f"Cannot encode: saved frame missing: {frame_path}")
+                safe_path = os_path_abspath(frame_path).replace("\\", "/").replace("'", "'\\''")
+                txt.write(f"file '{safe_path}' \n")
 
         # Create the upscaled video trying with selected codec OR x264 codec fallback
         codecs_to_try = [video_upscale_task.effective_codec, "libx264"]
@@ -3200,11 +3345,24 @@ class RealtimeLogWindow(CTkToplevel):
         self.render()
 
     def render(self) -> None:
+        buffer = app_state.log_buffer
+        entries = buffer.entries()
+        start = buffer.next_index - len(entries)
+        previous_end = getattr(self, "_rendered_end", start)
+        previous_start = getattr(self, "_rendered_start", start)
+        following = self.textbox.yview()[1] >= 0.999
         self.textbox.configure(state="normal")
-        self.textbox.delete("1.0", "end")
-        content = "\n".join(app_state.log_buffer.entries())
-        if content: self.textbox.insert("end", f"{content}\n")
-        self.textbox.see("end")
+        if previous_end < start or previous_end > buffer.next_index or not entries:
+            self.textbox.delete("1.0", "end")
+            previous_end = start
+        elif start > previous_start:
+            self.textbox.delete("1.0", f"{start - previous_start + 1}.0")
+        new_entries = entries[max(0, previous_end - start):]
+        if new_entries:
+            self.textbox.insert("end", "\n".join(new_entries) + "\n")
+        self._rendered_start, self._rendered_end = start, buffer.next_index
+        if following:
+            self.textbox.see("end")
         self.textbox.configure(state=DISABLED)
 
 def show_realtime_logs() -> None:
@@ -3216,6 +3374,8 @@ def show_realtime_logs() -> None:
 
 class FileWidget(CTkScrollableFrame):
     RENDER_BATCH_SIZE = 2
+    CARD_HEIGHT = 240
+    WINDOW_SIZE = 16
 
 
     def __init__(
@@ -3239,10 +3399,24 @@ class FileWidget(CTkScrollableFrame):
         self.index_row = 1
         self.ui_components = []
         self._render_generation = 0
+        self.media_data = {}
+        self.pending_media = {}
+        self.pending_resume = {}
+        self.resume_cache = {}
+        self._active_path = None
+        self._poll_timer = None
+        self._render_timer = None
+        self._visible_start = 0
+        self._visible_paths = []
+        self._top_spacer = CTkFrame(self, height=1, fg_color="transparent")
+        self._bottom_spacer = CTkFrame(self, height=1, fg_color="transparent")
 
         self._create_widgets()
+        self._poll_timer = self.after(40, self._poll_background)
 
     def _destroy_(self) -> None:
+        if app_state is not None and (app_state.starting or app_state.process_upscale_orchestrator is not None):
+            return
         self._render_generation += 1
         self.file_list = []
         if app_state is not None:
@@ -3252,16 +3426,72 @@ class FileWidget(CTkScrollableFrame):
         self.destroy()
         App.place_loadFile_section()
 
+    def destroy(self):
+        self._render_generation += 1
+        if self._poll_timer is not None:
+            self.after_cancel(self._poll_timer)
+            self._poll_timer = None
+        if self._render_timer is not None:
+            self.after_cancel(self._render_timer)
+            self._render_timer = None
+        for future in (*self.pending_media.values(), *self.pending_resume.values()):
+            future.cancel()
+        self.pending_media.clear()
+        self.pending_resume.clear()
+        self.media_data.clear()
+        super().destroy()
+
     def _create_widgets(self) -> None:
         self.add_clean_button()
+        self._sync_visible_cards(force=True)
+
+    def _sync_visible_cards(self, force=False):
+        # Isolate CTkScrollableFrame's canvas access here. Only a small window of
+        # fixed-height cards exists, regardless of the number of selected files.
+        scale = self._get_widget_scaling()
+        offset = max(0, self._parent_canvas.canvasy(0) / scale - 40)
+        start = max(0, min(max(0, len(self.file_list) - self.WINDOW_SIZE),
+                           int(offset // self.CARD_HEIGHT) - 3))
+        paths = self.file_list[start:start + self.WINDOW_SIZE]
+        if not force and paths == self._visible_paths:
+            return
+        self._visible_start = start
+        self._visible_paths = paths
+        for index in range(self.WINDOW_SIZE):
+            self.grid_rowconfigure(index + 2, minsize=round(self.CARD_HEIGHT * scale) if index < len(paths) else 0)
+        self._render_generation += 1
+        for item in list(self.ui_components):
+            if item["file_path"] not in paths:
+                item["card"].destroy()
+                self.ui_components.remove(item)
+        for path in list(self.pending_media):
+            if path not in paths and self.pending_media[path].done():
+                self.pending_media.pop(path)
+        top = start * self.CARD_HEIGHT
+        bottom = max(0, len(self.file_list) - start - len(paths)) * self.CARD_HEIGHT
+        self._top_spacer.configure(height=max(1, top))
+        self._top_spacer.grid(row=1, column=0, columnspan=3, sticky="ew")
+        if top == 0:
+            self._top_spacer.grid_remove()
+        self._bottom_spacer.configure(height=max(1, bottom))
+        self._bottom_spacer.grid(row=self.WINDOW_SIZE + 2, column=0, columnspan=3, sticky="ew")
+        if bottom == 0:
+            self._bottom_spacer.grid_remove()
+        for item in self.ui_components:
+            item["card"].grid_configure(row=paths.index(item["file_path"]) + 2)
         self._render_cards()
 
     def _render_cards(self) -> None:
+        if getattr(self, "_render_timer", None) is not None:
+            self.after_cancel(self._render_timer)
         self._render_generation = getattr(self, "_render_generation", 0) + 1
         render_generation = self._render_generation
-        file_paths = iter(self.file_list)
+        existing = {item["file_path"] for item in self.ui_components}
+        wanted = getattr(self, "_visible_paths", self.file_list)
+        file_paths = iter([path for path in wanted if path not in existing])
 
         def render_next_batch() -> None:
+            self._render_timer = None
             if render_generation != self._render_generation:
                 return
 
@@ -3271,16 +3501,20 @@ class FileWidget(CTkScrollableFrame):
                 except StopIteration:
                     return
 
+                if file_path not in self.file_list:
+                    continue
                 item = self._create_file_card(file_path)
                 if item is not None:
                     self.ui_components.append(item)
+                    if hasattr(self, "_visible_paths"):
+                        item["card"].grid_configure(row=self._visible_paths.index(file_path) + 2)
 
-            self.after_idle(render_next_batch)
+            self._render_timer = self.after_idle(render_next_batch)
 
         render_next_batch()
 
     def _remove_file(self, file_path: str) -> None:
-        if app_state is not None and app_state.process_upscale_orchestrator is not None: return # ignore while an upscale is running
+        if app_state is not None and (app_state.starting or app_state.process_upscale_orchestrator is not None): return
         if file_path not in self.file_list: return
 
         self.file_list.remove(file_path)
@@ -3288,28 +3522,35 @@ class FileWidget(CTkScrollableFrame):
             self._destroy_()
             return
 
-        self.clean_file_list()
-        self._render_cards()
+        for item in list(self.ui_components):
+            if item["file_path"] == file_path:
+                item["card"].destroy()
+                self.ui_components.remove(item)
+        self.media_data.pop(file_path, None)
+        future = self.pending_media.pop(file_path, None)
+        if future is not None:
+            future.cancel()
+        self._sync_visible_cards(force=True)
+        update_output_scale_for_target_resolution()
 
     def _create_file_card(self, file_path) -> Optional[dict]:
-        is_video, width, height, num_frames, frame_rate = self._read_media_properties(file_path)
-        file_icon = self.extract_file_icon(file_path)
+        is_video = check_if_file_is_video(file_path)
 
         # Card container
-        card = CTkFrame(self, fg_color = CARD_BACKGROUND_COLOR, corner_radius = 12, border_width = 2, border_color = CARD_BORDER_COLOR)
+        card = CTkFrame(self, height=self.CARD_HEIGHT - 12, fg_color = CARD_BACKGROUND_COLOR, corner_radius = 12, border_width = 2, border_color = CARD_ACCENT_COLOR if file_path == self._active_path else CARD_BORDER_COLOR)
+        card.grid_propagate(False)
         card.grid(row = self.index_row, column = 0, columnspan = 3, padx = 6, pady = (3, 9), sticky = "ew")
         card.grid_columnconfigure(1, weight = 1)
 
         # Thumbnail
-        thumbnail = CTkLabel(card, text = "", image = file_icon)
+        thumbnail = CTkLabel(card, text = "…", width=60, height=60)
         thumbnail.grid(row = 0, column = 0, padx = (12, 14), pady = 12, sticky = "n")
 
         # Remove-file button
         remove_button = CTkButton(card, command = lambda: self._remove_file(file_path), text = "X", width = 24, height = 24, font = bold11, fg_color = "transparent", hover_color = "#8C3B3B", border_width = 2, border_color = MESSAGE_ERROR_COLOR, text_color = MESSAGE_ERROR_COLOR, corner_radius = UI_CORNER_RADIUS)
         remove_button.grid(row = 0, column = 2, padx = (0, 8), pady = 12, sticky = "n")
-        for widget in (remove_button, remove_button._text_label):
-            widget.bind("<Enter>", lambda e: remove_button._text_label.configure(fg = "#FFFFFF"), add = "+")
-            widget.bind("<Leave>", lambda e: remove_button._text_label.configure(fg = MESSAGE_ERROR_COLOR), add = "+")
+        remove_button.bind("<Enter>", lambda e: remove_button.configure(text_color="#FFFFFF"), add="+")
+        remove_button.bind("<Leave>", lambda e: remove_button.configure(text_color=MESSAGE_ERROR_COLOR), add="+")
 
         # Text content column
         content = CTkFrame(card, fg_color = "transparent")
@@ -3324,53 +3565,137 @@ class FileWidget(CTkScrollableFrame):
         content_row += 1
 
         # Source meta line (duration / resolution / fps for videos, resolution for images)
-        meta_label = CTkLabel(content, text = self._format_source_meta(is_video, width, height, num_frames, frame_rate), font = bold12, text_color = CARD_MUTED_COLOR, anchor = "w")
+        meta_label = CTkLabel(content, text = "Loading preview…", font = bold12, text_color = CARD_MUTED_COLOR, anchor = "w")
         meta_label.grid(row = content_row, column = 0, sticky = "ew", pady = (2, 0))
         content_row += 1
 
-        dynamic_section = self._create_dynamic_section(content, content_row, is_video, file_path, width, height)
+        section = CTkFrame(content, fg_color="transparent")
+        section.grid(row=content_row, column=0, sticky="ew")
+        section.grid_columnconfigure(0, weight=1)
+        resume_label = CTkLabel(section, text="Checking resume…" if is_video else "", font=bold12,
+                                text_color=RESUME_ACCENT_COLOR, anchor="w", height=20)
+        resume_label.grid(row=0, column=0, sticky="ew")
+        bar = CTkProgressBar(section, height=8, progress_color=RESUME_ACCENT_COLOR)
+        bar.set(0)
+        bar.grid(row=1, column=0, sticky="ew", pady=(3, 6))
+        if not is_video:
+            bar.grid_remove()
+            resume_label.grid_remove()
+        table = self._create_pipeline_table(section, self._compute_pipeline_rows(0, 0))
+        table.grid(row=2, column=0, sticky="ew")
+        pipeline = table.cells
+        retry = CTkButton(section, text="Retry preview", height=24,
+                         command=lambda: self._retry_preview(file_path))
+        retry.grid(row=4, column=0, sticky="w")
+        retry.grid_remove()
 
         self.index_row += 1
-        return {"card": card, "content": content, "dynamic_row": content_row, "is_video": is_video, "file_path": file_path, "width": width, "height": height, "dynamic_section": dynamic_section}
+        return dict(card=card, content=content, is_video=is_video, file_path=file_path,
+                    width=0, height=0, thumbnail=thumbnail, meta_label=meta_label,
+                    resume_label=resume_label, pipeline=pipeline, retry=retry,
+                    resume_bar=bar, loaded=False, error=False, resume_key=None)
 
-    def _create_dynamic_section(
-            self,
-            content,
-            start_row,
-            is_video,
-            file_path,
-            width,
-            height
-            ) -> Optional[CTkFrame]:
+    def _retry_preview(self, path):
+        self.media_data.pop(path, None)
+        for item in self.ui_components:
+            if item["file_path"] == path:
+                item.update(loaded=False, error=False)
+                item["retry"].grid_remove()
+                item["meta_label"].configure(text="Loading preview…")
 
-        resume_percent  = get_video_resume_progress(file_path) if is_video else None
-        has_pipeline    = self.input_resize_factor != 0 and self.output_resize_factor != 0 and self.upscale_factor != 0
-        display_percent = resume_percent if resume_percent is not None else 0
+    def _poll_background(self):
+        if app_state.closing:
+            return
+        self._sync_visible_cards()
+        for key, future in list(self.pending_resume.items()):
+            if future.done():
+                del self.pending_resume[key]
+                try:
+                    self.resume_cache[key] = future.result()
+                except Exception:
+                    self.resume_cache[key] = None
+        while len(self.resume_cache) > 256:
+            self.resume_cache.pop(next(iter(self.resume_cache)))
+        for path, future in list(self.pending_media.items()):
+            if path not in self._visible_paths and future.done():
+                del self.pending_media[path]
+        started = timer()
+        for item in list(self.ui_components):
+            path = item["file_path"]
+            future = self.pending_media.get(path)
+            if future is not None and future.done():
+                del self.pending_media[path]
+                try:
+                    data = future.result()
+                    self.media_data[path] = {key: value for key, value in data.items() if key != "icon"}
+                    if data["icon"] is not None:
+                        icon = CTkImage(data["icon"], size=data["icon"].size)
+                        item["thumbnail"].configure(image=icon, text="")
+                    else:
+                        item["thumbnail"].configure(text="No preview")
+                    item["loaded"] = True
+                    self._update_item(item)
+                    if self.file_list and path == self.file_list[0]:
+                        update_output_scale_for_target_resolution()
+                except Exception as error:
+                    item["error"] = True
+                    item["meta_label"].configure(text=f"Preview unavailable: {str(error)[:90]}")
+                    item["retry"].grid()
+            if not item["loaded"] and not item["error"] and path not in self.pending_media and len(self.pending_media) < 2:
+                try:
+                    self.pending_media[path] = app_state.ui_jobs.submit(load_media_preview, path)
+                except Full:
+                    pass
+            if item["loaded"] and item["is_video"]:
+                key = self._resume_key(path)
+                if item["resume_key"] != key:
+                    item["resume_key"] = key
+                    item["resume_label"].configure(text="Checking resume…")
+                if key in app_state.completed_video_files:
+                    percent = 100
+                elif key in self.resume_cache:
+                    percent = self.resume_cache[key]
+                else:
+                    future = self.pending_resume.get(key)
+                    if future is not None and future.done():
+                        del self.pending_resume[key]
+                        try:
+                            self.resume_cache[key] = future.result()
+                        except Exception:
+                            self.resume_cache[key] = None
+                    elif future is None and len(self.pending_resume) < 2:
+                        try:
+                            self.pending_resume[key] = app_state.ui_jobs.submit(scan_resume_progress, key[-1])
+                        except Full:
+                            pass
+                    percent = self.resume_cache.get(key)
+                    if key not in self.resume_cache:
+                        continue
+                text = f"Completed {percent}%" if percent is not None else "No saved frames"
+                if item["resume_label"].cget("text") != text:
+                    item["resume_label"].configure(text=text)
+                    item["resume_bar"].set((percent or 0) / 100)
+            if timer() - started > 0.006:
+                break
+        self._poll_timer = self.after(40, self._poll_background)
 
-        if not is_video and not has_pipeline:
-            return None
+    def _resume_key(self, path):
+        return _completed_video_key(path)
 
-        section = CTkFrame(content, fg_color = "transparent")
-        section.grid_columnconfigure(0, weight = 1)
-        section.grid(row = start_row, column = 0, sticky = "ew")
-
-        inner_row = 0
-
-        if is_video:
-            badge = self._create_resume_badge(section, display_percent)
-            badge.grid(row = inner_row, column = 0, sticky = "ew", pady = (8, 0))
-            inner_row += 1
-
-        if has_pipeline:
-            separator = CTkFrame(section, fg_color = CARD_BORDER_COLOR, height = 1)
-            separator.grid(row = inner_row, column = 0, sticky = "ew", pady = (7, 6))
-            inner_row += 1
-
-            pipeline_rows  = self._compute_pipeline_rows(width, height)
-            pipeline_table = self._create_pipeline_table(section, pipeline_rows)
-            pipeline_table.grid(row = inner_row, column = 0, sticky = "ew")
-
-        return section
+    def _update_item(self, item):
+        data = self.media_data.get(item["file_path"])
+        if data is None:
+            return
+        width, height = get_target_ratio_dimensions(data["width"], data["height"],
+                                                   app_state.preferences.target_ratio, data["sar"])
+        item.update(width=width, height=height)
+        text = self._format_source_meta(data["is_video"], width, height, data["frames"], data["fps"])
+        if item["meta_label"].cget("text") != text:
+            item["meta_label"].configure(text=text)
+        for widgets, row in zip(item["pipeline"], self._compute_pipeline_rows(width, height)):
+            for widget, text in zip(widgets, row[:3]):
+                if widget.cget("text") != text:
+                    widget.configure(text=text)
 
     def add_clean_button(self) -> None:
 
@@ -3394,22 +3719,11 @@ class FileWidget(CTkScrollableFrame):
 
 
 
-    @cache
-    def extract_file_icon(self, file_path) -> CTkImage:
-        # Cached per file (path + mtime): thumbnails survive card list re-renders
-        return get_file_icon_cached(file_path)
-        
-    def _read_media_properties(self, file_path) -> tuple[bool, int, int, int, float]:
-        # Cached per file (path + mtime): re-rendering the whole card list after
-        # adding/removing a file must not re-probe every media file
-        return read_media_properties_cached(file_path)
-
     def _format_source_meta(self, is_video, width, height, num_frames, frame_rate) -> str:
         if not is_video:
             return f"{width}×{height}"
         duration = num_frames / frame_rate if frame_rate else 0
-        minutes  = int(duration / 60)
-        seconds  = round(duration % 60)
+        minutes, seconds = divmod(round(duration), 60)
         return f"{minutes}m {seconds}s  |  {width}×{height}  |  {round(frame_rate, 1)} fps"
 
     def _compute_pipeline_rows(self, width, height) -> list[tuple]:
@@ -3417,70 +3731,23 @@ class FileWidget(CTkScrollableFrame):
         input_height  = int(height * (self.input_resize_factor  / 100))
         ai_width      = int(input_width  * self.upscale_factor)
         ai_height     = int(input_height * self.upscale_factor)
-        output_width  = int(ai_width  * (self.output_resize_factor / 100))
-        output_height = int(ai_height * (self.output_resize_factor / 100))
+        output_factor = self.output_resize_factor / 100
+        target = get_target_resolution_height(app_state.preferences.target_resolution) if app_state is not None else 0
+        if target > 0 and width > 0 and height > 0 and self.input_resize_factor > 0 and self.upscale_factor > 0:
+            output_factor = calculate_output_factor_for_target(width, height, self.input_resize_factor / 100, self.upscale_factor, target)
+        output_width  = round(ai_width * output_factor)
+        output_height = round(ai_height * output_factor)
 
         # (label, detail, resolution, is_ai)
         return [
             ("Input",  f"{self.input_resize_factor}%",  f"{input_width}×{input_height}",   False),
             ("AI",     f"x{self.upscale_factor}",       f"{ai_width}×{ai_height}",         True),
-            ("Output", f"{self.output_resize_factor}%", f"{output_width}×{output_height}", False),
+            ("Output", f"{output_factor * 100:g}%", f"{output_width}×{output_height}", False),
         ]
-
-    def _create_resume_badge(self, parent, percent) -> CTkFrame:
-        badge = CTkFrame(parent, fg_color = RESUME_BADGE_COLOR, corner_radius = 8)
-        badge.grid_columnconfigure(1, weight = 1)
-
-        CTkLabel(badge, text = "Completed", font = bold12, text_color = RESUME_ACCENT_COLOR, anchor = "w").grid(row = 0, column = 0, padx = (10, 10), pady = 7, sticky = "w")
-
-        bar = CTkProgressBar(badge, height = 8, corner_radius = 4, fg_color = CARD_BORDER_COLOR, progress_color = RESUME_ACCENT_COLOR)
-        bar.set(0)
-        bar.grid(row = 0, column = 1, pady = 7, sticky = "ew")
-
-        percent_label = CTkLabel(badge, text = "0%", font = bold12, text_color = RESUME_ACCENT_COLOR, width = 42, anchor = "e")
-        percent_label.grid(row = 0, column = 2, padx = (10, 10), pady = 7, sticky = "e")
-
-        self._animate_progress_bar(bar, percent / 100, percent_label, percent)
-
-        return badge
-
-    def _animate_progress_bar(self, bar, target, percent_label = None, percent = 0, current = 0.0) -> None:
-        # Ease-out fill from 0 to the target value, with the colour fading in from a dim
-        # tone to the full accent and the percentage counting up; stops if destroyed.
-        if not bar.winfo_exists(): return
-        current += (target - current) * 0.08
-        ratio = current / target if target > 0 else 1.0
-        bar.configure(progress_color = lerp_hex(RESUME_BAR_DIM_COLOR, RESUME_ACCENT_COLOR, min(1.0, ratio)))
-        if percent_label is not None and percent_label.winfo_exists():
-            percent_label.configure(text = f"{round(current * 100)}%")
-        if target - current < 0.005:
-            bar.set(target)
-            if percent_label is not None and percent_label.winfo_exists():
-                percent_label.configure(text = f"{percent}%")
-            if percent >= 100:
-                self._glow_bar(bar)
-            else:
-                bar.configure(progress_color = RESUME_ACCENT_COLOR)
-            return
-        bar.set(current)
-        bar.after(20, lambda: self._animate_progress_bar(bar, target, percent_label, percent, current))
-
-    def _glow_bar(self, bar, step = 0, sequence = None) -> None:
-        # Slow double pulse when the bar reaches 100%, settling back on the accent.
-        if not bar.winfo_exists(): return
-        if sequence is None:
-            peak = "#C4FFDC"
-            up   = [lerp_hex(RESUME_ACCENT_COLOR, peak, i / 6) for i in range(7)]
-            down = [lerp_hex(peak, RESUME_ACCENT_COLOR, i / 6) for i in range(1, 7)]
-            sequence = up + down + up + down   # two slow pulses
-        if step >= len(sequence):
-            bar.configure(progress_color = RESUME_ACCENT_COLOR)
-            return
-        bar.configure(progress_color = sequence[step])
-        bar.after(45, lambda: self._glow_bar(bar, step + 1, sequence))
 
     def _create_pipeline_table(self, parent, pipeline_rows) -> CTkFrame:
         table = CTkFrame(parent, fg_color = "transparent")
+        table.cells = []
         table.grid_columnconfigure(0, minsize = 96)   # label
         table.grid_columnconfigure(1, minsize = 96)   # detail (same width as label -> equal spacing)
         table.grid_columnconfigure(2, weight = 1)     # resolution (fills remaining space)
@@ -3489,36 +3756,37 @@ class FileWidget(CTkScrollableFrame):
             label_color  = CARD_ACCENT_COLOR if is_ai else CARD_MUTED_COLOR
             detail_color = CARD_ACCENT_COLOR if is_ai else CARD_FAINT_COLOR
             value_color  = CARD_ACCENT_COLOR if is_ai else CARD_VALUE_COLOR
-            CTkLabel(table, text = label,      font = bold12, text_color = label_color,  anchor = "w", height = 20).grid(row = row_index, column = 0, sticky = "w", pady = 0)
-            CTkLabel(table, text = detail,     font = bold12, text_color = detail_color, anchor = "w", height = 20).grid(row = row_index, column = 1, sticky = "w", pady = 0)
-            CTkLabel(table, text = resolution, font = bold12, text_color = value_color,  anchor = "w", height = 20).grid(row = row_index, column = 2, sticky = "w", padx = (0, 14), pady = 0)
+            cells = []
+            for column, (text, color) in enumerate(((label, label_color), (detail, detail_color), (resolution, value_color))):
+                cell = CTkLabel(table, text=text, font=bold12, text_color=color, anchor="w", height=20)
+                cell.grid(row=row_index, column=column, sticky="w", pady=0)
+                cells.append(cell)
+            table.cells.append(tuple(cells))
 
         return table
 
 
     # EXTERNAL FUNCTIONS
 
-    def clean_file_list(self) -> None:
-        self.index_row = 1
-        for item in self.ui_components: item["card"].destroy()
-        self.ui_components = []
-
     def refresh_pipeline(self) -> None:
         for item in self.ui_components:
-            if item["dynamic_section"] is not None:
-                item["dynamic_section"].destroy()
-            item["dynamic_section"] = self._create_dynamic_section(item["content"], item["dynamic_row"], item["is_video"], item["file_path"], item["width"], item["height"])
+            self._update_item(item)
     
     def get_selected_file_list(self) -> list: 
         return self.file_list 
 
     def highlight_active_file(self, file_number: int) -> None:
-        # Accent border on the card currently being processed (1-based, matches processing order).
-        for index, item in enumerate(self.ui_components):
-            if not item["card"].winfo_exists(): continue
-            item["card"].configure(border_color = CARD_ACCENT_COLOR if index == file_number - 1 else CARD_BORDER_COLOR)
+        path = self.file_list[file_number - 1] if 0 < file_number <= len(self.file_list) else None
+        if self._active_path == path:
+            return
+        previous = self._active_path
+        self._active_path = path
+        for item in self.ui_components:
+            if item["file_path"] in (previous, path):
+                item["card"].configure(border_color=CARD_ACCENT_COLOR if item["file_path"] == path else CARD_BORDER_COLOR)
 
     def clear_active_highlight(self) -> None:
+        self._active_path = None
         for item in self.ui_components:
             if item["card"].winfo_exists(): item["card"].configure(border_color = CARD_BORDER_COLOR)
 
@@ -3552,6 +3820,15 @@ def get_values_for_file_widget() -> tuple:
     return upscale_factor, input_resize_factor, output_resize_factor
 
 def update_file_widget(a, b, c) -> None:
+    if app_state is None or app_state.closing:
+        return
+    if app_state.refresh_timer is not None:
+        app_state.window.after_cancel(app_state.refresh_timer)
+    app_state.refresh_timer = app_state.window.after(180, _refresh_file_widget)
+
+
+def _refresh_file_widget():
+    app_state.refresh_timer = None
     file_widget = None if app_state is None else app_state.file_widget
     if file_widget is None:
         return
@@ -3585,19 +3862,17 @@ def get_first_file_source_dimensions() -> Optional[tuple[int, int]]:
     if app_state is None or not app_state.selected_file_list: return None
 
     file_path = app_state.selected_file_list[0]
-    if not os_path_exists(file_path): return None
-
-    if check_if_file_is_video(file_path):
-        width, height = get_ratio_locked_video_resolution(file_path, app_state.preferences.target_ratio)
-        return (width, height) if width > 0 and height > 0 else None
-
-    height, width = get_image_resolution(image_read(file_path))
-    return get_target_ratio_dimensions(width, height, app_state.preferences.target_ratio)
+    widget = app_state.file_widget
+    data = widget.media_data.get(file_path) if widget is not None else None
+    if data is None:
+        return None
+    return get_target_ratio_dimensions(data["width"], data["height"], app_state.preferences.target_ratio, data["sar"])
 
 def update_output_scale_for_target_resolution(a = None, b = None, c = None) -> None:
     # Recompute the Output scale % textbox when a target resolution preset is active.
     # Trace-compatible signature (a, b, c) so it can be attached to StringVar traces.
     if app_state is None or app_state.selected_output_resize_factor is None: return
+    update_file_widget(1, 2, 3)
 
     target_height = get_target_resolution_height(app_state.preferences.target_resolution)
     if target_height <= 0: return   # OFF -> keep the manual value
@@ -3627,61 +3902,41 @@ def update_output_scale_for_target_resolution(a = None, b = None, c = None) -> N
         target_size         = target_height
     )
 
-    app_state.selected_output_resize_factor.set(str(round(output_resize_factor * 100)))
-    update_file_widget(1, 2, 3)
+    value = str(round(output_resize_factor * 100))
+    if app_state.selected_output_resize_factor.get() != value:
+        app_state.selected_output_resize_factor.set(value)
 
-def _completed_video_key(video_path: str) -> tuple:
+def _completed_video_key(video_path: str, config=None, source_key=None) -> tuple:
     # Ties the "already completed" flag to the settings used when it was completed, so
     # changing AI model/sharpening/resize factors doesn't keep showing a stale 100% badge.
+    data = app_state.file_widget.media_data.get(video_path, {}) if app_state.file_widget is not None else {}
+    if config is None:
+        model, sharpening = get_current_ai_model(), get_current_sharpening_amount()
+        try:
+            input_factor = float(app_state.selected_input_resize_factor.get()) / 100
+            output_factor = float(app_state.selected_output_resize_factor.get()) / 100
+        except ValueError:
+            input_factor, output_factor = 0, 0
+        ratio, target = app_state.preferences.target_ratio, app_state.preferences.target_resolution
+        deinterlace = app_state.preferences.deinterlace
+        codec, extension = app_state.preferences.video_codec, app_state.preferences.video_extension
+        output_path, source_root = app_state.selected_output_path.get(), app_state.source_root
+    else:
+        model, sharpening = config.selected_AI_model, config.selected_sharpening_amount
+        input_factor, output_factor = config.input_resize_factor, config.output_resize_factor
+        ratio, target = config.selected_target_ratio, config.selected_target_resolution
+        deinterlace = config.selected_deinterlace
+        codec, extension = config.selected_video_codec, config.selected_video_extension
+        output_path, source_root = config.selected_output_path, config.source_root
+    directory = _build_output_path_base(video_path, output_path, source_root)
+    directory += _build_name_suffix(model, sharpening, ratio)
+    if get_target_resolution_height(target) > 0:
+        output_factor = None  # The preset determines this separately for each file.
     return (
-        video_path,
-        app_state.preferences.ai_model,
-        app_state.preferences.sharpening,
-        str(app_state.selected_input_resize_factor.get()),
-        str(app_state.selected_output_resize_factor.get()),
-        app_state.preferences.target_ratio,
+        source_key if source_key is not None else data.get("key", (video_path, None)),
+        model, sharpening, input_factor, output_factor, ratio, target, deinterlace, codec, extension,
+        directory,
     )
-
-def get_video_resume_progress(video_path: str) -> Optional[int]:
-    # Extension is ignored on purpose: extracted frames are always ".jpg" and upscaled
-    # frames always carry the AI model name, whatever output extension is selected.
-    if _completed_video_key(video_path) in app_state.completed_video_files: return 100
-
-    selected_AI_model          = get_current_ai_model()
-    selected_output_path       = app_state.selected_output_path.get()
-    selected_sharpening_amount = get_current_sharpening_amount()
-
-    try:
-        input_resize_factor  = int(float(str(app_state.selected_input_resize_factor.get()))) / 100
-        output_resize_factor = int(float(str(app_state.selected_output_resize_factor.get()))) / 100
-    except Exception:
-        return None
-
-    selected_target_ratio = app_state.preferences.target_ratio
-
-    target_directory  = _build_output_path_base(video_path, selected_output_path, app_state.source_root)
-    target_directory += _build_name_suffix(
-        selected_AI_model          = selected_AI_model,
-        input_resize_factor        = input_resize_factor,
-        output_resize_factor       = output_resize_factor,
-        selected_sharpening_amount = selected_sharpening_amount,
-        selected_target_ratio      = selected_target_ratio,
-    )
-    raw_frames_directory      = os_path_join(target_directory, "Raw")
-    upscaled_frames_directory = os_path_join(target_directory, "Upscale")
-
-    if not os_path_exists(raw_frames_directory) or not os_path_exists(upscaled_frames_directory):
-        return None
-
-    upscaled_frames = [f for f in os_listdir(upscaled_frames_directory) if f.endswith(".jpg")]
-    if not upscaled_frames:
-        return None
-
-    extracted_frames = [f for f in os_listdir(raw_frames_directory) if f.endswith(".jpg") and f.startswith("frame_")]
-    if not extracted_frames:
-        return None
-
-    return min(100, int(len(upscaled_frames) / len(extracted_frames) * 100))
 
 def build_processing_config() -> Optional[ProcessingConfig]:
     # Selected files 
@@ -3696,14 +3951,6 @@ def build_processing_config() -> Optional[ProcessingConfig]:
         return None
 
     app_state.selected_file_list = selected_file_list
-
-
-    # Output disk space
-    disk_space_warning = check_disk_space(app_state.selected_output_path.get(), selected_file_list)
-    if disk_space_warning is not None:
-        app_state.info_message.set("Not enough disk space")
-        show_disk_space_error_message(disk_space_warning)
-        return None
 
 
     # AI model
@@ -3756,7 +4003,7 @@ def build_processing_config() -> Optional[ProcessingConfig]:
     selected_gpu = GPU.find(app_state.preferences.gpu)
 
     return ProcessingConfig(
-        selected_file_list         = selected_file_list,
+        selected_file_list         = list(selected_file_list),
         source_root                = app_state.source_root,
         selected_output_path       = app_state.selected_output_path.get(),
         selected_AI_model          = selected_AI_model,
@@ -3842,12 +4089,19 @@ def apply_app_zoom(zoom: float) -> None:
     set_widget_scaling(zoom)
 
 def load_selected_files(selected_file_list: list[str], source_root: Optional[str] = None) -> None:
+    if app_state.closing or app_state.starting or app_state.process_upscale_orchestrator is not None:
+        return
     if not selected_file_list:
         app_state.info_message.set("Not supported files :(")
         return
 
     upscale_factor, input_resize_factor, output_resize_factor = get_values_for_file_widget()
 
+    selected_file_list = list(dict.fromkeys(selected_file_list))
+    if app_state.file_widget is not None:
+        app_state.file_widget.destroy()
+    for widget in getattr(App, "_load_widgets", []):
+        widget.place_forget()
     app_state.selected_file_list = selected_file_list
     app_state.source_root        = source_root
     app_state.file_widget = FileWidget(
@@ -3867,20 +4121,49 @@ def open_files_action():
     app_state.info_message.set("Selecting files")
 
     uploaded_files_list = list(filedialog.askopenfilenames())
+    if not uploaded_files_list:
+        app_state.info_message.set("Ready")
+        return
     supported_files_list = [file for file in uploaded_files_list if is_supported_file(file)]
     print(f"> Uploaded files: {len(uploaded_files_list)} => Supported files: {len(supported_files_list)}")
     load_selected_files(supported_files_list)
 
 def open_folder_action():
+    if app_state.folder_future is not None and not app_state.folder_future.done():
+        app_state.folder_cancel.set()
+        app_state.folder_future.cancel()
+        app_state.folder_future = None
+        app_state.info_message.set("Folder scan cancelled")
+        return
     app_state.info_message.set("Selecting folder")
     source_root = filedialog.askdirectory()
     if not source_root:
         app_state.info_message.set("Ready")
         return
 
-    supported_files_list = discover_supported_files(source_root)
-    print(f"> Selected folder: {source_root} => Supported files: {len(supported_files_list)}")
-    load_selected_files(supported_files_list, source_root)
+    if app_state.folder_cancel is not None:
+        app_state.folder_cancel.set()
+    cancel = Event()
+    app_state.folder_cancel = cancel
+    app_state.info_message.set("Scanning folder… SELECT FOLDER again to cancel")
+    try:
+        app_state.folder_future = app_state.ui_jobs.submit(discover_supported_files, source_root, cancel)
+    except Full:
+        app_state.info_message.set("Preview workers busy; try selecting the folder again")
+        return
+    future = app_state.folder_future
+    def collect():
+        if app_state.closing or cancel.is_set():
+            return
+        if not future.done():
+            app_state.window.after(80, collect)
+            return
+        try:
+            load_selected_files(future.result(), source_root)
+        except Exception as error:
+            app_state.info_message.set(f"Cannot read folder: {error}")
+        app_state.folder_future = None
+    app_state.window.after(80, collect)
 
 def open_output_path_action():
     asked_selected_output_path = filedialog.askdirectory()
@@ -3949,8 +4232,9 @@ def save_user_choices_in_json() -> None:
         "default_VRAM_limiter":         app_state.preferences.vram_limiter,
     }
     user_preference_json = json_dumps(user_preference)
-    with open(USER_PREFERENCE_PATH, "w", encoding="utf-8") as preference_file:
-        preference_file.write(user_preference_json)
+    with atomic_destination(USER_PREFERENCE_PATH) as temporary:
+        with open(temporary, "w", encoding="utf-8") as preference_file:
+            preference_file.write(user_preference_json)
 
 def load_user_preferences() -> UserPreferences:
     if os_path_exists(USER_PREFERENCE_PATH):
@@ -3983,17 +4267,32 @@ def load_user_preferences() -> UserPreferences:
     print(f"[{app_name}] Preference file does not exist, using default coded value")
     return UserPreferences()
 
+def cancel_tk_callbacks(window):
+    # Cancel callbacks before Tcl commands are deleted (including toolkit timers).
+    for callback in window.tk.splitlist(window.tk.call("after", "info")):
+        # Cancel the timer only. Its owning widget still owns the Tcl command
+        # and will delete it during destroy; using root.after_cancel here would
+        # delete another widget's command twice.
+        window.tk.call("after", "cancel", callback)
+
+
 def on_app_close() -> None:
-    # 1. Save user choices in file
-    save_user_choices_in_json()
-
-    # 2. Destroy app window
-    app_state.window.grab_release()
-    app_state.window.destroy()
-
-    # 3. Stop upscale process and thread check_upscale_step
-    write_process_status(app_state.process_status_q, f"{CLOSE_APP_STATUS}")
-    stop_upscale_process()
+    if app_state.closing:
+        if not app_state.stopping:
+            stop_upscale_process(CLOSE_APP_STATUS)
+        return
+    try:
+        save_user_choices_in_json()
+    except OSError as error:
+        print(f"Cannot save preferences: {error}")
+    app_state.closing = True
+    if app_state.refresh_timer is not None:
+        app_state.window.after_cancel(app_state.refresh_timer)
+        app_state.refresh_timer = None
+    if app_state.folder_cancel is not None:
+        app_state.folder_cancel.set()
+    app_state.ui_jobs.close()
+    stop_upscale_process(CLOSE_APP_STATUS)
 
 class App():
 
@@ -4034,6 +4333,14 @@ class App():
 
     @staticmethod
     def place_loadFile_section() -> None:
+        existing = getattr(App, "_load_widgets", None)
+        if existing:
+            background, input_file_text, input_files_button, input_folder_button = existing
+            background.place(relx=0, rely=0, relwidth=0.5, relheight=1)
+            App.place_at(input_file_text, 0.25, 0.4)
+            App.place_at(input_files_button, 0.25, 0.5)
+            App.place_at(input_folder_button, 0.25, 0.56)
+            return
         background = App.create_panel_background()
 
         text_drop = (" SUPPORTED FILES \n\n "
@@ -4083,6 +4390,7 @@ class App():
         App.place_at(input_file_text, 0.25, 0.4)
         App.place_at(input_files_button, 0.25, 0.5)
         App.place_at(input_folder_button, 0.25, 0.56)
+        App._load_widgets = (background, input_file_text, input_files_button, input_folder_button)
 
     @staticmethod
     def place_app_name() -> None:
@@ -4578,7 +4886,7 @@ class App():
                 "    is produced as 9:16\n"
                 "  - Works for both images and videos, and is part of the Target resolution\n"
                 "    preset calculation\n"
-                "  - Output folders carry a Ratio tag (e.g. _Ratio-4_3) when not Auto\n",
+                "  - Output folders carry a Ratio tag (e.g. _Ratio-4.3) when not Auto\n",
             ]
 
             open_info_messagebox("Target ratio", "Lock or override the output aspect ratio", option_list)
@@ -4716,7 +5024,11 @@ class App():
         run(1)
 
     @staticmethod
-    def place_stop_button() -> None: 
+    def place_stop_button() -> None:
+        existing = getattr(App, "_action_button", None)
+        if existing is not None and existing.winfo_exists():
+            existing.configure(command=stop_button_command, text="STOP", image=stop_icon, border_color="#EC1D1D")
+            return
         stop_button = App.create_active_button(
             command      = stop_button_command,
             text         = "STOP",
@@ -4726,9 +5038,14 @@ class App():
             border_color = "#EC1D1D"
         )
         App.place_at(stop_button, 0.62, ROW_ACTIONS)
+        App._action_button = stop_button
 
     @staticmethod
-    def place_upscale_button() -> None: 
+    def place_upscale_button() -> None:
+        existing = getattr(App, "_action_button", None)
+        if existing is not None and existing.winfo_exists():
+            existing.configure(command=upscale_button_command, text="UPSCALE", image=upscale_icon, border_color=UI_ACCENT_COLOR)
+            return
         upscale_button = App.create_active_button(
             command = upscale_button_command,
             text    = "UPSCALE",
@@ -4737,6 +5054,7 @@ class App():
             height  = 30
         )
         App.place_at(upscale_button, 0.62, ROW_ACTIONS)
+        App._action_button = upscale_button
 
 
     # Menu callbacks (select_*) ----------------------------
@@ -5036,20 +5354,15 @@ if __name__ == "__main__":
 
     preferences = load_user_preferences()
     app_state = AppState(preferences = preferences)
+    app_state.ui_jobs = BackgroundJobs()
 
     set_appearance_mode("Dark")
     set_default_color_theme("dark-blue")
     apply_app_zoom(float(preferences.app_zoom.replace("%", "")) / 100)
 
-    free_ram_gb = psutil_virtual_memory().available / (1024**3)
-    if   free_ram_gb < 8:  queue_maxsize = 30
-    elif free_ram_gb < 16: queue_maxsize = 50
-    elif free_ram_gb < 32: queue_maxsize = 100
-    elif free_ram_gb < 64: queue_maxsize = 150
-    else:                  queue_maxsize = 200
-    print(f"[{app_name}] free RAM: {free_ram_gb:.2f} GB - queue_maxsize = {queue_maxsize}")
+    queue_maxsize = 64  # Small completion records only; no image arrays in IPC.
     
-    process_status_q           = multiprocessing_manager.Queue(maxsize=1)
+    process_status_q           = multiprocessing_manager.Queue()
     video_frames_and_info_q    = multiprocessing_manager.Queue(maxsize=queue_maxsize)
     event_stop_upscale_process = multiprocessing_manager.Event()
 
