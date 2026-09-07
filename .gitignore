@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller
+build/
+dist/
+
+# Runtime assets (large binaries, downloaded per machine)
+Assets/ffmpeg.exe
+Assets/ffplay.exe
+Assets/ffprobe.exe
+AI-onnx/*.onnx

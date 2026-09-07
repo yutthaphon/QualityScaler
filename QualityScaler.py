@@ -1640,13 +1640,60 @@ def build_deinterlaced_video_command(
         deinterlaced_video_path,
     ]
 
+def get_video_sample_aspect_ratio(video_path: str) -> float:
+    # Anamorphic sources (DVD/HDV) store e.g. 720x480 with SAR 8:9, so players show
+    # them as 4:3. Return the sample (pixel) aspect ratio, 1.0 for square pixels,
+    # unknown ("0:1") or when probing fails.
+    try:
+        probe_process = subprocess_Popen(
+            [FFPROBE_EXE_PATH, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=sample_aspect_ratio", "-of", "csv=p=0", video_path],
+            stdout      = subprocess_PIPE,
+            stderr      = subprocess_DEVNULL,
+            startupinfo = get_subprocess_startupinfo(),
+        )
+        probe_output, _ = probe_process.communicate(timeout = 30)
+        value           = probe_output.decode(errors = "ignore").strip().strip(",").split(",")[0]
+        if ":" in value:
+            numerator, _, denominator = value.partition(":")
+            numerator   = float(numerator)
+            denominator = float(denominator)
+            if numerator > 0 and denominator > 0: return numerator / denominator
+    except Exception as e:
+        print(f"[Resolution] ffprobe SAR check failed: {e}")
+    return 1.0
+
+def get_square_pixel_dimensions(width: int, height: int, sample_aspect_ratio: float) -> tuple[int, int]:
+    # Convert storage dimensions to square-pixel (display) dimensions.
+    # Video encoders require even sizes.
+    if sample_aspect_ratio <= 0 or abs(sample_aspect_ratio - 1.0) < 0.01: return width, height
+    display_width = round(width * sample_aspect_ratio)
+    if display_width % 2 != 0: display_width += 1
+    return display_width, height
+
+def get_video_display_resolution(video_path: str) -> tuple[int, int]:
+    # Storage frame dimensions corrected for anamorphic sources (SAR != 1:1)
+    video_capture = opencv_VideoCapture(video_path)
+    width         = round(video_capture.get(CAP_PROP_FRAME_WIDTH))
+    height        = round(video_capture.get(CAP_PROP_FRAME_HEIGHT))
+    video_capture.release()
+    return get_square_pixel_dimensions(width, height, get_video_sample_aspect_ratio(video_path))
+
+def get_square_pixel_filter(width: int, height: int, sample_aspect_ratio: float) -> str:
+    # ffmpeg filter that stretches anamorphic frames to square pixels, "" when not needed
+    display_width, display_height = get_square_pixel_dimensions(width, height, sample_aspect_ratio)
+    if (display_width, display_height) == (width, height): return ""
+    return f"scale={display_width}:{display_height},setsar=1"
+
 def build_video_frame_extraction_command(
-        video_path:     str,
-        output_pattern: str,
-        video_fps:      float,
+        video_path:          str,
+        output_pattern:      str,
+        video_fps:           float,
+        pixel_aspect_filter: str = "",
         ) -> list[str]:
     # The lossless FFV1 intermediate is decoded in software.  Automatic hardware
     # decode can select Vulkan, which cannot feed the CPU fps/MJPEG chain.
+    video_filter = f"{pixel_aspect_filter},fps={video_fps}" if pixel_aspect_filter else f"fps={video_fps}"
     return [
         FFMPEG_EXE_PATH,
         "-y",
@@ -1656,7 +1703,7 @@ def build_video_frame_extraction_command(
         "-threads",    "0",
         "-err_detect", "ignore_err",
         "-i",          video_path,
-        "-vf",         f"fps={video_fps}",
+        "-vf",         video_filter,
         "-an",
         "-qscale:v",   "3",
         output_pattern,
@@ -2260,7 +2307,15 @@ def upscale_video(
         video_capture       = opencv_VideoCapture(video_path)
         video_frames_number = int(video_capture.get(CAP_PROP_FRAME_COUNT))
         video_fps           = sanitize_fps(video_capture.get(CAP_PROP_FPS))
+        video_width         = round(video_capture.get(CAP_PROP_FRAME_WIDTH))
+        video_height        = round(video_capture.get(CAP_PROP_FRAME_HEIGHT))
         video_capture.release()
+
+        # 1b. Anamorphic sources (e.g. 720x480 DVD flagged 4:3): stretch the frames
+        #     to square pixels during extraction so the aspect ratio is preserved
+        pixel_aspect_filter = get_square_pixel_filter(video_width, video_height, get_video_sample_aspect_ratio(video_path))
+        if pixel_aspect_filter:
+            print(f"[Resolution] Anamorphic source detected, extracting frames at square pixels: {pixel_aspect_filter}")
 
         # 2. Create directory to extract frames
         os_makedirs(raw_frames_directory, mode=0o777, exist_ok=True)
@@ -2273,6 +2328,7 @@ def upscale_video(
             video_path,
             output_pattern,
             video_fps,
+            pixel_aspect_filter,
         )
 
         # 4. Execute FFMPEG command
@@ -3180,11 +3236,12 @@ class FileWidget(CTkScrollableFrame):
         
     def _read_media_properties(self, file_path) -> tuple[bool, int, int, int, float]:
         if check_if_file_is_video(file_path):
-            cap        = opencv_VideoCapture(file_path)
-            width      = round(cap.get(CAP_PROP_FRAME_WIDTH))
-            height     = round(cap.get(CAP_PROP_FRAME_HEIGHT))
-            num_frames = int(cap.get(CAP_PROP_FRAME_COUNT))
-            frame_rate = sanitize_fps(cap.get(CAP_PROP_FPS))
+            # Display resolution: anamorphic sources (SAR != 1:1) are shown at
+            # their displayed size, matching what the pipeline will produce
+            width, height = get_video_display_resolution(file_path)
+            cap           = opencv_VideoCapture(file_path)
+            num_frames    = int(cap.get(CAP_PROP_FRAME_COUNT))
+            frame_rate    = sanitize_fps(cap.get(CAP_PROP_FPS))
             cap.release()
             return True, width, height, num_frames, frame_rate
 
